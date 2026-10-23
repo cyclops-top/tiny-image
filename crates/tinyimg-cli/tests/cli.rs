@@ -713,3 +713,35 @@ fn concurrent_progress_counts_skips_and_errors_once_without_changing_reports() {
     assert!(ordinary.contains("Reference scan incomplete: test failure"));
     assert!(!ordinary.contains("not visually calibrated"));
 }
+
+#[test]
+fn human_text_sizes_and_savings_match_unchanged_json_bytes() {
+    let dir = TempDir::new().unwrap();
+    png(&dir.path().join("image.png"));
+    let args = ["--dry-run", "--formats", "png", "--jobs", "1"];
+    let structured = bin()
+        .arg(dir.path())
+        .args(args)
+        .args(["--report", "json"])
+        .output()
+        .unwrap();
+    assert!(structured.status.success());
+    let report = json(&structured);
+    let summary = &report["summary"];
+    let expected = tinyimg_core::format_savings(
+        summary["original_bytes"].as_u64().unwrap(),
+        summary["optimized_bytes"].as_u64().unwrap(),
+        summary["saving_bytes"].as_u64().unwrap(),
+    );
+    let text = bin().arg(dir.path()).args(args).output().unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert_eq!(
+        text.matches(&expected).count(),
+        2,
+        "file and total use the same sizes: {text}"
+    );
+    assert!(text.contains("KB"));
+    assert!(text.contains("% ("));
+    assert!(!text.contains(" bytes"));
+}

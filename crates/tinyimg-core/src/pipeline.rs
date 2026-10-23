@@ -95,6 +95,46 @@ pub struct Summary {
     pub saving_bytes: u64,
     pub elapsed_ms: u64,
 }
+
+/// Format decimal byte units with one fractional digit, capped at GB.
+/// Round before selecting the unit so boundaries never display `1000.0 KB`.
+pub fn format_size(bytes: u64) -> String {
+    const UNITS: [(u128, &str); 4] = [
+        (1, "B"),
+        (1_000, "KB"),
+        (1_000_000, "MB"),
+        (1_000_000_000, "GB"),
+    ];
+    for (divisor, unit) in UNITS {
+        let tenths = (u128::from(bytes) * 10 + divisor / 2) / divisor;
+        if tenths < 10_000 || unit == "GB" {
+            return format!("{}.{:01} {unit}", tenths / 10, tenths % 10);
+        }
+    }
+    unreachable!("GB is the final, uncapped unit")
+}
+
+/// Format the saved percentage to one decimal using unrounded byte counts.
+pub fn format_saved_percentage(original: u64, saved: u64) -> String {
+    let percent_tenths = if original == 0 {
+        0
+    } else {
+        (u128::from(saved) * 1_000 + u128::from(original) / 2) / u128::from(original)
+    };
+    format!("{}.{}%", percent_tenths / 10, percent_tenths % 10)
+}
+
+/// Show original/result sizes and savings, calculated from unrounded bytes.
+pub fn format_savings(original: u64, result: u64, saved: u64) -> String {
+    format!(
+        "{} -> {}, saved {} ({})",
+        format_size(original),
+        format_size(result),
+        format_saved_percentage(original, saved),
+        format_size(saved)
+    )
+}
+
 impl Report {
     pub fn text(&self, verbose: bool) -> String {
         let mut text = String::new();
@@ -110,17 +150,16 @@ impl Report {
         let mut text = String::new();
 
         text.push_str(&format!(
-            "\n{} files; {} optimized, {} skipped, {} errors; {} bytes saved ({:.1}%); {} ms\n",
+            "\n{} files; {} optimized, {} skipped, {} errors; {}; {} ms\n",
             self.summary.scanned,
             self.summary.optimized,
             self.summary.skipped,
             self.summary.errors,
-            self.summary.saving_bytes,
-            if self.summary.original_bytes > 0 {
-                self.summary.saving_bytes as f64 * 100. / self.summary.original_bytes as f64
-            } else {
-                0.
-            },
+            format_savings(
+                self.summary.original_bytes,
+                self.summary.optimized_bytes,
+                self.summary.saving_bytes,
+            ),
             self.summary.elapsed_ms
         ));
         for r in &self.reference_warnings {
@@ -158,13 +197,15 @@ impl FileReport {
             ));
         } else {
             text.push_str(&format!(
-                "{} {} -> {}  {} -> {} bytes (-{}), score {}\n",
+                "{} {} -> {}  {}, score {}\n",
                 file.status.to_uppercase(),
                 file.source.display(),
                 file.output.as_deref().unwrap_or(&file.source).display(),
-                file.original_bytes,
-                file.optimized_bytes.unwrap_or(file.original_bytes),
-                file.saving_bytes,
+                format_savings(
+                    file.original_bytes,
+                    file.optimized_bytes.unwrap_or(file.original_bytes),
+                    file.saving_bytes,
+                ),
                 file.score
                     .map(|n| format!(
                         "{n:.2}{}",
@@ -180,10 +221,10 @@ impl FileReport {
         if verbose || analyze {
             for c in &file.candidates {
                 text.push_str(&format!(
-                    "  {} {:?}: {} bytes, score {}, accepted={}{}\n",
+                    "  {} {:?}: {}, score {}, accepted={}{}\n",
                     c.encoder,
                     c.quality,
-                    c.size,
+                    format_size(c.size as u64),
                     c.score
                         .map(|n| format!("{n:.2}"))
                         .unwrap_or_else(|| "lossless/N/A".into()),
@@ -706,4 +747,146 @@ fn absolute_normalized(path: &Path) -> Result<PathBuf> {
         }
     }
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_use_decimal_units_and_one_fractional_digit() {
+        for (bytes, expected) in [
+            (0, "0.0 B"),
+            (1, "1.0 B"),
+            (999, "999.0 B"),
+            (1_000, "1.0 KB"),
+            (1_049, "1.0 KB"),
+            (1_050, "1.1 KB"),
+            (820_400, "820.4 KB"),
+            (999_949, "999.9 KB"),
+            (999_950, "1.0 MB"),
+            (1_000_000, "1.0 MB"),
+            (1_500_000, "1.5 MB"),
+            (999_949_999, "999.9 MB"),
+            (999_950_000, "1.0 GB"),
+            (1_000_000_000, "1.0 GB"),
+            (1_000_000_000_000, "1000.0 GB"),
+            (u64::MAX, "18446744073.7 GB"),
+        ] {
+            assert_eq!(format_size(bytes), expected, "bytes={bytes}");
+        }
+    }
+
+    #[test]
+    fn savings_use_exact_byte_counts_before_rounding() {
+        assert_eq!(
+            format_savings(1_500_000, 820_400, 679_600),
+            "1.5 MB -> 820.4 KB, saved 45.3% (679.6 KB)"
+        );
+        // The percentage uses 1,049 bytes, not the displayed 1.0 KB.
+        assert_eq!(
+            format_savings(1_049, 999, 50),
+            "1.0 KB -> 999.0 B, saved 4.8% (50.0 B)"
+        );
+        assert_eq!(
+            format_savings(2_000, 1_999, 1),
+            "2.0 KB -> 2.0 KB, saved 0.1% (1.0 B)"
+        );
+        assert_eq!(
+            format_savings(u64::MAX, 0, u64::MAX),
+            "18446744073.7 GB -> 0.0 B, saved 100.0% (18446744073.7 GB)"
+        );
+    }
+
+    #[test]
+    fn savings_handle_empty_and_unchanged_files() {
+        assert_eq!(
+            format_savings(0, 0, 0),
+            "0.0 B -> 0.0 B, saved 0.0% (0.0 B)"
+        );
+        assert_eq!(
+            format_savings(1_500_000, 1_500_000, 0),
+            "1.5 MB -> 1.5 MB, saved 0.0% (0.0 B)"
+        );
+    }
+
+    fn sample_report() -> Report {
+        Report {
+            version: "test".into(),
+            mode: "dry-run".into(),
+            presets_calibrated: false,
+            cache_enabled: false,
+            files: vec![FileReport {
+                source: "source.png".into(),
+                output: Some("output.png".into()),
+                status: "planned".into(),
+                cache_hit: false,
+                reason: None,
+                original_bytes: 1_500_000,
+                optimized_bytes: Some(820_400),
+                saving_bytes: 679_600,
+                score: Some(88.0),
+                score_basis: None,
+                encoder: Some("test-encoder".into()),
+                format: Some("png".into()),
+                width: Some(100),
+                height: Some(100),
+                has_alpha: Some(false),
+                class: None,
+                android: None,
+                candidates: vec![CandidateSummary {
+                    encoder: "test-encoder".into(),
+                    format: imaging::Format::Png,
+                    quality: Some(80),
+                    size: 820_400,
+                    score: Some(88.0),
+                    lossless: false,
+                    accepted: true,
+                    note: None,
+                }],
+                warnings: vec![],
+                elapsed_ms: 12,
+            }],
+            summary: Summary {
+                scanned: 1,
+                optimized: 1,
+                original_bytes: 1_500_000,
+                optimized_bytes: 820_400,
+                saving_bytes: 679_600,
+                elapsed_ms: 12,
+                ..Default::default()
+            },
+            renames: vec![],
+            reference_warnings: vec![],
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn text_reports_show_human_readable_file_candidate_and_total_sizes() {
+        let report = sample_report();
+        let text = report.text(true);
+        assert!(text.contains(
+            "PLANNED source.png -> output.png  1.5 MB -> 820.4 KB, saved 45.3% (679.6 KB), score 88.00\n"
+        ));
+        assert!(text.contains("test-encoder Some(80): 820.4 KB, score 88.00, accepted=true\n"));
+        assert!(text.contains(
+            "1 files; 1 optimized, 0 skipped, 0 errors; 1.5 MB -> 820.4 KB, saved 45.3% (679.6 KB); 12 ms\n"
+        ));
+        assert!(text.is_ascii());
+    }
+
+    #[test]
+    fn json_reports_keep_numeric_byte_fields() {
+        let json = serde_json::to_value(sample_report()).unwrap();
+        for fields in [&json["files"][0], &json["summary"]] {
+            assert_eq!(fields["original_bytes"].as_u64(), Some(1_500_000));
+            assert_eq!(fields["optimized_bytes"].as_u64(), Some(820_400));
+            assert_eq!(fields["saving_bytes"].as_u64(), Some(679_600));
+        }
+        assert_eq!(
+            json["files"][0]["candidates"][0]["size"].as_u64(),
+            Some(820_400)
+        );
+    }
 }
