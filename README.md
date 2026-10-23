@@ -93,6 +93,18 @@ make target-install TARGET=aarch64-unknown-linux-gnu
 
 盘符、UNC、大小写碰撞、只读属性和原子替换都有平台差异。当前仅要求实际验证 Linux；Windows/macOS 侧使用原生路径与编译依赖设计，并保留平台测试入口，但这里不声称已经在 Windows 或 macOS 运行验证。首次在目标系统使用，仍应先执行 `make test`、`--dry-run` 和 `-o` 抽查。
 
+## 命令帮助
+
+```sh
+tinyimg -h                    # 简要参数说明
+tinyimg --help                # 完整参数、默认值、安全限制、退出码和示例
+tinyimg analyze --help
+tinyimg refs --help
+tinyimg init --help
+```
+
+目录默认递归扫描，不需要 `-r` 或 `--recursive`；不传路径时使用当前目录。带空格的路径请加引号，例如 `tinyimg "./图片 资源" --dry-run`。帮助中列出的是内置默认值，配置文件和显式命令行参数仍按原有优先级生效。
+
 ## 建议的第一轮使用
 
 ```sh

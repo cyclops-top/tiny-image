@@ -13,12 +13,71 @@ use tinyimg_core::{
     scanner,
 };
 
+const OPTIMIZE_HELP: &str = r#"Operation:
+  PATH accepts one or more files or directories; omitted PATH means current directory.
+  Directories are scanned recursively. No -r/--recursive flag is needed.
+  Default mode modifies originals and may change extensions/remove old files.
+  Directory in-place writes with eligible images require y/yes at [y/N].
+  Enter, EOF or any other answer cancels; --backup still requires confirmation.
+  Explicit files do not prompt. Use --dry-run, --backup DIR or -o DIR first.
+  Output/backup directories are excluded from scanning; existing output/backup files are not overwritten.
+  Descendant .git, target, node_modules and .tinyimg-cache directories are pruned.
+  Symlinks are not followed; explicit symlink inputs are rejected.
+
+Configuration and limits:
+  Listed defaults are built-in values; tinyimg.toml and CLI options may override them.
+  Priority: built-in defaults < top-level config < matching overrides (in order) < CLI.
+  Static PNG, JPEG and WebP inputs are supported. AVIF output is opt-in; external AVIF
+  input is not decoded. Protected Android resources and unsafe/unsupported inputs are skipped.
+  Preset scores are experimental, not visually calibrated. Every saved result must be smaller.
+  Safety limits: 256 MiB input, 8000 pixels per side, 16 million pixels; AVIF: 4 million pixels.
+
+Terminal and reports:
+  Interactive terminals show per-image phases/attempts and total progress on stderr.
+  JSON, --quiet, redirected stdout/stderr and TERM=dumb disable progress.
+  NO_COLOR disables colors. Human sizes use decimal units (1 KB = 1000 B), one decimal.
+  JSON retains integer bytes. Prompts/fatal errors use stderr; per-file results use the report.
+  --quiet does not bypass confirmation.
+
+Exit codes:
+  0 success or user cancellation; 1 runtime/file error; 2 invalid arguments/configuration;
+  3 --check found optimizable files (no files changed).
+
+Examples:
+  tinyimg ./images --dry-run
+  tinyimg "./图片 资源" -o ./optimized
+  tinyimg a.png b.webp --keep-format --formats png,webp --dry-run
+  tinyimg ./images --backup ./originals --jobs 4
+  tinyimg ./images --include '**/*.png' --exclude '**/vendor/**' --dry-run
+  tinyimg ./images --check --report json
+  tinyimg analyze ./images --preset high
+  tinyimg refs ./app
+  tinyimg init
+  tinyimg --dry-run -- -leading-dash.png
+
+Use 'tinyimg <COMMAND> --help' for subcommand details."#;
+
+const ANALYZE_HELP: &str = r#"Read-only analysis:
+  Recursively evaluate selected images and show all tested candidates; never write images,
+  output directories, backups, processed-output markers or report files.
+  Processed-output markers are always bypassed. --output/--backup do not write in this mode.
+  Do not combine analyze with --dry-run, --check or --report-file; use stdout/redirection.
+  Built-in quality/filter defaults and tinyimg.toml precedence match normal optimization.
+  Preset scores are experimental, not visually calibrated. AVIF is output-only and opt-in.
+  Progress is terminal-only and is disabled by JSON, --quiet or redirected stdout/stderr.
+  --quiet suppresses text, not JSON. Exit codes: 0 success, 1 runtime/file error, 2 invalid usage.
+
+Examples:
+  tinyimg analyze ./images
+  tinyimg analyze "./图片 资源" --formats png,webp --score 90
+  tinyimg analyze ./images --report json > analysis.json"#;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "tinyimg",
     version,
     about = "Offline perceptual image optimization for Android/App resources",
-    after_help = "WARNING: default mode modifies originals. Directory inputs require confirmation [y/N].\nUse --dry-run or -o out/ to avoid replacing originals.\nPreset scores are experimental, not visually calibrated. AVIF is opt-in; external AVIF input is not decoded."
+    after_help = OPTIMIZE_HELP
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,12 +88,20 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Compare all tested candidates without changing any files.
+    #[command(after_help = ANALYZE_HELP)]
     Analyze(Box<OptimizeArgs>),
     /// Find hard-coded image filename references; never edits sources.
+    #[command(
+        after_help = "Recursively scan supported text/source files for hard-coded image filename references.\nNo images or source files are changed. PATH defaults to the current directory.\nThis is an advisory literal search, not a parser; dynamic/binary references may be missed.\nFinding references is not an error (exit 0).\n\nExamples:\n  tinyimg refs ./app\n  tinyimg refs ./app --report json"
+    )]
     Refs(RefsArgs),
     /// Create a configuration template without overwriting an existing file.
+    #[command(
+        after_help = "The parent directory must already exist. Existing files are never overwritten.\n\nExamples:\n  tinyimg init\n  tinyimg init ./config/tinyimg.toml"
+    )]
     Init {
-        #[arg(default_value = "tinyimg.toml")]
+        /// Destination for the new configuration template.
+        #[arg(default_value = "tinyimg.toml", value_name = "PATH")]
         path: PathBuf,
     },
 }
@@ -45,57 +112,91 @@ enum ReportFormat {
 }
 #[derive(Debug, Clone, Args)]
 struct OptimizeArgs {
+    /// Files/directories to process recursively [default: current directory].
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
-    #[arg(long,value_parser=["high","balanced","small"])]
+    /// Quality preset: high=88, balanced=80, small=70 [default: balanced].
+    #[arg(long, value_parser=["high","balanced","small"], value_name = "PRESET")]
     preset: Option<String>,
-    #[arg(long)]
+    /// SSIMULACRA2 target, 0..100; overrides the preset in this layer.
+    #[arg(long, value_name = "SCORE")]
     score: Option<f64>,
-    #[arg(long, value_delimiter = ',')]
+    /// Comma-separated candidate formats: png,webp,jpeg (or jpg),avif [default: png,webp].
+    #[arg(long, value_delimiter = ',', value_name = "FORMATS")]
     formats: Option<Vec<String>>,
+    /// Restrict candidates to the input format (must also be in --formats); always used for assets.
     #[arg(long)]
     keep_format: bool,
+    /// Minimum PNG-to-other-format saving, 0..100 percent [default: 10].
+    ///
+    /// Compared with the best eligible PNG candidate, or the original PNG if none exists.
+    /// Not a universal minimum saving for same-format results; every saved result must be smaller.
     #[arg(long, value_name = "PCT")]
     min_saving: Option<f64>,
-    /// Skip inputs smaller than this byte count (default 2048).
-    #[arg(long)]
+    /// Skip inputs smaller than this many bytes [default: 2048].
+    #[arg(long, value_name = "BYTES")]
     min_bytes: Option<u64>,
+    /// Include matching relative paths; repeat for multiple globs (quote patterns; use / separators).
+    ///
+    /// CLI patterns replace the config include list. Multiple roots add root-name prefixes to paths.
     #[arg(long, value_name = "GLOB")]
     include: Vec<String>,
+    /// Exclude matching relative paths/directories; repeat for multiple globs (quote patterns).
+    ///
+    /// CLI patterns replace the config exclude list; built-in safety exclusions remain active.
     #[arg(long, value_name = "GLOB")]
     exclude: Vec<String>,
+    /// Write optimized files to DIR instead of replacing originals; skipped files are not copied.
+    ///
+    /// Preserves relative paths; multiple roots get root-name prefixes. Not a complete input mirror.
+    /// Existing destinations are never overwritten. Incompatible with --backup.
     #[arg(short = 'o', long, value_name = "DIR", conflicts_with = "backup")]
     output: Option<PathBuf>,
+    /// Back up originals before in-place writes; preserve relative paths and never overwrite backups.
     #[arg(long, value_name = "DIR")]
     backup: Option<PathBuf>,
+    /// Strip removable metadata; unsafe color/orientation cases still retain the original.
     #[arg(long, conflicts_with = "keep_metadata")]
     strip_all: bool,
+    /// Preserve metadata using PNG lossless optimization only; other source formats are skipped.
     #[arg(long)]
     keep_metadata: bool,
+    /// Evaluate planned changes without writing images, directories, markers or report files.
     #[arg(long, conflicts_with = "check")]
     dry_run: bool,
+    /// Read-only check: exit 3 if any file can be optimized; otherwise 0 (errors still fail).
     #[arg(long)]
     check: bool,
-    #[arg(long)]
+    /// Parallel image workers, 1..64 [default: min(4, CPU parallelism)]; more workers use more memory.
+    #[arg(long, value_name = "N")]
     jobs: Option<usize>,
-    /// Bypass processed-output markers and recompute candidates; never writes cache.
+    /// Bypass processed-output markers and recompute candidates; never read/write those markers.
     #[arg(long)]
     no_cache: bool,
+    /// Report format; JSON retains numeric byte counts and disables terminal progress.
     #[arg(long, value_enum, default_value = "text")]
     report: ReportFormat,
+    /// Create a new report file instead of stdout; never overwrite; unavailable in read-only modes.
+    ///
+    /// Parent directory must exist. Image extensions are rejected; report creation uses path safety checks.
     #[arg(long, value_name = "PATH")]
     report_file: Option<PathBuf>,
+    /// Read this TOML config [default: nearest tinyimg.toml found upward from the first input].
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+    /// Show configuration, worker count, candidate details and experimental-preset notice.
     #[arg(short = 'v', long, conflicts_with = "quiet")]
     verbose: bool,
+    /// Suppress text/progress, not JSON, fatal errors or directory confirmation; conflicts with -v.
     #[arg(short = 'q', long)]
     quiet: bool,
 }
 #[derive(Debug, Args)]
 struct RefsArgs {
+    /// Files/directories to scan recursively [default: current directory].
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
+    /// Print matching source locations and image literals as text or JSON.
     #[arg(long, value_enum, default_value = "text")]
     report: ReportFormat,
 }
@@ -417,4 +518,93 @@ fn preflight_report(path: &std::path::Path) -> Result<(), (u8, anyhow::Error)> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn every_exposed_option_and_path_has_a_help_description() {
+        let command = Cli::command();
+        for command in std::iter::once(&command).chain(command.get_subcommands()) {
+            for argument in command.get_arguments() {
+                assert!(
+                    argument.get_help().is_some() || argument.get_long_help().is_some(),
+                    "{}: {} has no help",
+                    command.get_name(),
+                    argument.get_id(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_examples_parse_quoted_unicode_globs_and_leading_dash_paths() {
+        for arguments in [
+            vec!["tinyimg", "./images", "--dry-run"],
+            vec!["tinyimg", "./图片 资源", "-o", "./optimized"],
+            vec![
+                "tinyimg",
+                "a.png",
+                "b.webp",
+                "--keep-format",
+                "--formats",
+                "png,webp",
+                "--dry-run",
+            ],
+            vec![
+                "tinyimg",
+                "./images",
+                "--backup",
+                "./originals",
+                "--jobs",
+                "4",
+            ],
+            vec![
+                "tinyimg",
+                "./images",
+                "--include",
+                "**/*.png",
+                "--exclude",
+                "**/vendor/**",
+                "--dry-run",
+            ],
+            vec!["tinyimg", "./images", "--check", "--report", "json"],
+            vec!["tinyimg", "analyze", "./images", "--preset", "high"],
+            vec![
+                "tinyimg",
+                "analyze",
+                "./图片 资源",
+                "--formats",
+                "png,webp",
+                "--score",
+                "90",
+            ],
+            vec!["tinyimg", "analyze", "./images", "--report", "json"],
+            vec!["tinyimg", "refs", "./app", "--report", "json"],
+            vec!["tinyimg", "init"],
+            vec!["tinyimg", "init", "./config/tinyimg.toml"],
+            vec!["tinyimg", "--dry-run", "--", "-leading-dash.png"],
+        ] {
+            assert!(Cli::try_parse_from(&arguments).is_ok(), "{arguments:?}");
+        }
+        let cli = Cli::try_parse_from(["tinyimg", "--dry-run", "--", "-leading-dash.png"]).unwrap();
+        assert_eq!(cli.args.paths, vec![PathBuf::from("-leading-dash.png")]);
+    }
+
+    #[test]
+    fn help_defaults_remain_documentation_not_cli_overrides() {
+        let cli = Cli::try_parse_from(["tinyimg"]).unwrap();
+        assert!(cli.args.paths.is_empty());
+        assert!(cli.args.preset.is_none());
+        assert!(cli.args.score.is_none());
+        assert!(cli.args.formats.is_none());
+        assert!(cli.args.min_saving.is_none());
+        assert!(cli.args.min_bytes.is_none());
+        assert!(cli.args.jobs.is_none());
+        assert!(cli.args.config.is_none());
+        assert!(!cli.args.dry_run && !cli.args.check);
+    }
 }

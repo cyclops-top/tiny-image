@@ -3,7 +3,7 @@
 Verified on x86_64 Linux (Debian 13), Rust 1.99.1, default locked dependency features:
 
 - `make check`: rustfmt and workspace/all-target Clippy with warnings denied passed.
-- `make test`: 104 core unit tests, 10 CLI progress unit tests, and 35 CLI integration tests passed (149 total).
+- `make test`: 104 core unit tests, 13 CLI unit tests, and 36 CLI integration tests passed (153 total).
 - `cargo deny check licenses sources`: passed with cargo-deny 0.20.2.
 - `cargo about generate --locked --workspace --fail --format json -o THIRD-PARTY-LICENSES.json`: passed with cargo-about 0.9.2 (`--features cli` required when installing it). Machine-local path metadata was normalized with `scripts/sanitize_license_inventory.py`; full license texts remain unchanged.
 - `make release`: Linux release executable built successfully.
@@ -12,6 +12,8 @@ Verified on x86_64 Linux (Debian 13), Rust 1.99.1, default locked dependency fea
 The included Linux executable dynamically links glibc, libm and libgcc_s; this build references GLIBC_2.39. It is not a universal Linux/static binary. Build from source on older distributions.
 
 The suite exercises real PNG/WebP/JPEG/AVIF roundtrips, final-byte measured SSIMULACRA2 and exact lossless identity, transparency, metadata restrictions, quality search, conversion savings, Android manifests/density rules, no-write modes, output preservation, rollback/no-clobber, bounded source reads, Unicode/spaces, Unix non-UTF-8 JSON paths, and root aliases versus descendant symlinks.
+
+CLI help tests require descriptions for every exposed option/path, parse the documented examples (including Chinese/spaced paths, globs and leading-dash filenames), verify documentation does not inject CLI defaults, and check root/analyze/refs/init help without filesystem changes. Generated help was also inspected from the Linux release binary.
 
 Human-readable formatting tests cover decimal unit boundaries and rounding, zero savings, exact byte-derived savings percentages, maximum u64 sizes, per-file/candidate/summary output, and unchanged numeric JSON fields. Spinner selection tests cover UTF-8 braille dots, legacy/non-UTF-8 ASCII fallback, single-column animation frames, CJK display-width column alignment, narrow multiline layouts, status colors, NO_COLOR/dumb-terminal gating, and escaping filenames before styling.
 

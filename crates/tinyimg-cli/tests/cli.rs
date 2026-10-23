@@ -745,3 +745,84 @@ fn human_text_sizes_and_savings_match_unchanged_json_bytes() {
     assert!(text.contains("% ("));
     assert!(!text.contains(" bytes"));
 }
+
+#[test]
+fn complete_help_describes_defaults_safety_modes_and_examples_without_io() {
+    let directory = TempDir::new().unwrap();
+    fs::write(directory.path().join("keep.txt"), b"unchanged").unwrap();
+    let before = tree(directory.path());
+    for (arguments, expected) in [
+        (
+            vec!["--help"],
+            vec![
+                "Directories are scanned recursively",
+                "[y/N]",
+                "[default: 2048]",
+                "min(4, CPU parallelism)",
+                "Not a universal minimum",
+                "--report-file",
+                "NO_COLOR",
+                "Exit codes:",
+                "--dry-run -- -leading-dash.png",
+            ],
+        ),
+        (
+            vec!["-h"],
+            vec![
+                "--preset",
+                "--keep-metadata",
+                "--jobs",
+                "--config",
+                "--quiet",
+                "Examples:",
+            ],
+        ),
+        (
+            vec!["analyze", "--help"],
+            vec![
+                "Read-only analysis:",
+                "always bypassed",
+                "Do not combine analyze",
+                "--report json > analysis.json",
+            ],
+        ),
+        (
+            vec!["refs", "--help"],
+            vec![
+                "advisory literal search",
+                "never edits sources",
+                "exit 0",
+                "--report json",
+            ],
+        ),
+        (
+            vec!["init", "--help"],
+            vec![
+                "[default: tinyimg.toml]",
+                "parent directory must already exist",
+                "never overwritten",
+            ],
+        ),
+        (
+            vec!["missing-image.png", "--help"],
+            vec!["Usage:", "Configuration and limits:"],
+        ),
+    ] {
+        let output = bin()
+            .current_dir(directory.path())
+            .args(&arguments)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{arguments:?}");
+        assert!(output.stderr.is_empty());
+        let help = String::from_utf8(output.stdout).unwrap();
+        let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for phrase in expected {
+            assert!(
+                normalized.contains(phrase),
+                "missing {phrase:?} in {arguments:?}: {help}"
+            );
+        }
+        assert_eq!(tree(directory.path()), before);
+    }
+}
