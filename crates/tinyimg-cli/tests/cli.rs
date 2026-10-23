@@ -5,13 +5,24 @@ use image::{
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::Path,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 use tempfile::TempDir;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tinyimg"))
+}
+fn confirmed(cmd: &mut Command) -> Output {
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    child.wait_with_output().unwrap()
 }
 fn png(path: &Path) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -100,7 +111,7 @@ fn all_readonly_modes_leave_entire_tree_unchanged() {
         let r = json(&out);
         assert_eq!(r["summary"]["optimized"], 1);
         assert_eq!(tree(d.path()), before);
-        assert_eq!(r["cache_enabled"], false);
+        assert_eq!(r["cache_enabled"], mode != "analyze");
     }
 }
 #[test]
@@ -155,11 +166,11 @@ fn miniature_android_project_protects_special_resources() {
     fs::write(res.join("drawable/vector.xml"), "<vector/>").unwrap();
     let nine = fs::read(res.join("drawable/nine.9.png")).unwrap();
     let brand = fs::read(res.join("mipmap-hdpi/brand.png")).unwrap();
-    let out = bin()
-        .arg(&res)
-        .args(["--formats", "png", "--report", "json"])
-        .output()
-        .unwrap();
+    let out = confirmed(
+        bin()
+            .arg(&res)
+            .args(["--formats", "png", "--report", "json"]),
+    );
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -456,4 +467,165 @@ fn explicit_output_root_alias_resolves_but_descendant_symlinks_are_rejected() {
         .unwrap();
     assert_eq!(result.status.code(), Some(1));
     assert!(!foreign.join("a.png").exists());
+}
+
+#[test]
+fn processed_marker_prevents_repeat_work_and_readonly_checks_do_not_modify_it() {
+    let d = TempDir::new().unwrap();
+    let input = d.path().join("input");
+    let source = input.join("nested/a.png");
+    png(&source);
+    let first = confirmed(bin().arg(&input).args([
+        "--formats",
+        "png",
+        "--min-bytes",
+        "0",
+        "--report",
+        "json",
+    ]));
+    assert!(first.status.success());
+    assert_eq!(json(&first)["summary"]["optimized"], 1);
+    assert!(input.join(".tinyimg-cache").is_dir());
+    let after = tree(d.path());
+    let second = bin()
+        .arg(&source)
+        .args([
+            "--formats",
+            "png",
+            "--min-bytes",
+            "0",
+            "--check",
+            "--report",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let result = json(&second);
+    assert_eq!(result["summary"]["cache_hits"], 1);
+    assert_eq!(tree(d.path()), after);
+    let uncached = bin()
+        .arg(&source)
+        .args([
+            "--formats",
+            "png",
+            "--min-bytes",
+            "0",
+            "--check",
+            "--no-cache",
+            "--report",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(uncached.status.success());
+    let result = json(&uncached);
+    assert_eq!(result["cache_enabled"], false);
+    assert_eq!(result["summary"]["cache_hits"], 0);
+    assert_eq!(tree(d.path()), after);
+}
+
+#[test]
+fn output_markers_do_not_modify_input_tree_and_settings_changes_invalidate_them() {
+    let d = TempDir::new().unwrap();
+    let input = d.path().join("input");
+    let source = input.join("a.png");
+    png(&source);
+    let before = tree(&input);
+    let output = d.path().join("out");
+    let first = bin()
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .args(["--formats", "png", "--min-bytes", "0", "--report", "json"])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    assert_eq!(tree(&input), before);
+    assert!(output.join(".tinyimg-cache").is_dir());
+    let second = bin()
+        .arg(&output)
+        .args([
+            "--formats",
+            "png",
+            "--min-bytes",
+            "0",
+            "--check",
+            "--report",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    assert_eq!(json(&second)["summary"]["cache_hits"], 1);
+    let changed = bin()
+        .arg(&output)
+        .args([
+            "--formats",
+            "png",
+            "--min-bytes",
+            "0",
+            "--score",
+            "99",
+            "--check",
+            "--report",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(changed.status.success());
+    assert_eq!(json(&changed)["summary"]["cache_hits"], 0);
+}
+
+#[test]
+fn explicit_avif_output_is_real_and_external_avif_input_remains_skipped() {
+    let d = TempDir::new().unwrap();
+    let source = d.path().join("a.png");
+    png(&source);
+    let original = fs::read(&source).unwrap();
+    let output = d.path().join("out");
+    let result = bin()
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .args([
+            "--formats",
+            "avif",
+            "--min-saving",
+            "0",
+            "--score",
+            "50",
+            "--report",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report = json(&result);
+    assert_eq!(report["summary"]["optimized"], 1);
+    assert_eq!(report["files"][0]["encoder"], "ravif");
+    assert!(report["files"][0]["score"].as_f64().unwrap() >= 50.0);
+    let avif = output.join("a.avif");
+    assert_eq!(
+        image::guess_format(&fs::read(&avif).unwrap()).unwrap(),
+        image::ImageFormat::Avif
+    );
+    assert_eq!(fs::read(&source).unwrap(), original);
+    let again = bin()
+        .arg("analyze")
+        .arg(&avif)
+        .args(["--min-bytes", "0", "--report", "json"])
+        .output()
+        .unwrap();
+    assert!(again.status.success());
+    assert_eq!(json(&again)["summary"]["skipped"], 1);
 }

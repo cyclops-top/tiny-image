@@ -29,6 +29,7 @@ pub struct RunOptions {
     pub backup: Option<PathBuf>,
     pub mode: Mode,
     pub jobs: usize,
+    pub use_cache: bool,
 }
 #[derive(Debug, Serialize)]
 pub struct FileReport {
@@ -37,6 +38,7 @@ pub struct FileReport {
     #[serde(serialize_with = "crate::paths::serialize_optional_path")]
     pub output: Option<PathBuf>,
     pub status: String,
+    pub cache_hit: bool,
     pub reason: Option<String>,
     pub original_bytes: u64,
     pub optimized_bytes: Option<u64>,
@@ -71,6 +73,7 @@ pub struct Summary {
     pub scanned: usize,
     pub optimized: usize,
     pub skipped: usize,
+    pub cache_hits: usize,
     pub errors: usize,
     pub original_bytes: u64,
     pub optimized_bytes: u64,
@@ -169,6 +172,7 @@ fn base_report(item: &scanner::ScanItem) -> FileReport {
         source: item.source.clone(),
         output: None,
         status: "skipped".into(),
+        cache_hit: false,
         reason: None,
         original_bytes: std::fs::symlink_metadata(&item.source)
             .map(|m| m.len())
@@ -190,8 +194,49 @@ fn base_report(item: &scanner::ScanItem) -> FileReport {
     }
 }
 
+/// Read-only preflight with a fixed file list. Executing consumes this snapshot,
+/// so files discovered after an interactive confirmation are never added.
+#[derive(Debug)]
+pub struct PreparedRun {
+    options: RunOptions,
+    scan: scanner::ScanResult,
+    selected_roots: Vec<PathBuf>,
+    reference_roots: Vec<PathBuf>,
+    excluded_dirs: Vec<PathBuf>,
+    has_directory_inputs: bool,
+    eligible_images: usize,
+}
+impl PreparedRun {
+    /// Supported, unprotected images selected by the filters and minimum size.
+    /// Decoding, cache checks, and candidate evaluation may still skip these.
+    pub fn eligible_images(&self) -> usize {
+        self.eligible_images
+    }
+
+    /// Known skips retained in the scan; directory entries omitted by filters
+    /// are not included in this count.
+    pub fn known_skipped(&self) -> usize {
+        self.scan.items.len() - self.eligible_images
+    }
+
+    pub fn requires_confirmation(&self) -> bool {
+        self.options.mode == Mode::Write
+            && self.options.output.is_none()
+            && self.has_directory_inputs
+            && self.eligible_images > 0
+    }
+
+    pub fn run(self) -> Result<Report> {
+        run_prepared(self)
+    }
+}
+
 pub fn run(options: &RunOptions) -> Result<Report> {
-    let start = Instant::now();
+    prepare(options)?.run()
+}
+
+/// Validate and select inputs without creating files, caches, or directories.
+pub fn prepare(options: &RunOptions) -> Result<PreparedRun> {
     let mut normalized = options.clone();
     normalized.output = options
         .output
@@ -238,7 +283,24 @@ pub fn run(options: &RunOptions) -> Result<Report> {
         }
     }
     let reference_roots = scanner::reference_roots(&options.inputs);
-    let scan = scanner::scan(
+    let mut has_directory_inputs = false;
+    let selected_roots = options
+        .inputs
+        .iter()
+        .map(|input| {
+            let resolved = std::fs::canonicalize(input)?;
+            Ok(if resolved.is_dir() {
+                has_directory_inputs = true;
+                resolved
+            } else {
+                resolved
+                    .parent()
+                    .context("input file has no parent")?
+                    .to_path_buf()
+            })
+        })
+        .collect::<Result<Vec<PathBuf>>>()?;
+    let mut scan = scanner::scan(
         &options.inputs,
         &ScanOptions {
             include: global.include.unwrap_or_default(),
@@ -247,24 +309,80 @@ pub fn run(options: &RunOptions) -> Result<Report> {
         },
     )?;
     // Validate every effective configuration before the first possible write.
-    for item in &scan.items {
-        options
+    for item in &mut scan.items {
+        let settings = options
             .config
-            .effective(&item.relative_path, &options.cli_settings)?
-            .optimize_options(item.is_asset)?;
+            .effective(&item.relative_path, &options.cli_settings)?;
+        settings.optimize_options(item.is_asset)?;
+        let min_bytes = settings.min_bytes.unwrap_or(2048);
+        // Freeze minimum-size exclusions too: a file growing while the user is
+        // deciding must not become an unconfirmed write when the count was zero.
+        if item.skip_reason.is_none()
+            && std::fs::symlink_metadata(&item.source)
+                .is_ok_and(|metadata| metadata.len() < min_bytes)
+        {
+            item.skip_reason = Some(format!("smaller than min_bytes ({min_bytes})"));
+        }
     }
+    let eligible_images = scan
+        .items
+        .iter()
+        .filter(|item| item.skip_reason.is_none())
+        .count();
+    Ok(PreparedRun {
+        options: normalized,
+        scan,
+        selected_roots,
+        reference_roots,
+        excluded_dirs,
+        has_directory_inputs,
+        eligible_images,
+    })
+}
+
+fn run_prepared(prepared: PreparedRun) -> Result<Report> {
+    let start = Instant::now();
+    let PreparedRun {
+        options,
+        scan,
+        selected_roots,
+        reference_roots,
+        excluded_dirs,
+        ..
+    } = prepared;
+    let options = &options;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.jobs)
         .build()
         .context("create image worker pool")?;
-    let files=pool.install(||scan.items.par_iter().map(|item|{
-  let started=Instant::now();
-  let mut report=base_report(item);
-  if let Some(reason)=&item.skip_reason{report.reason=Some(reason.clone());return report;}
-  let outcome=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||process(item,options,&mut report)));
-  match outcome {Ok(Ok(()))=>{},Ok(Err(error))=>{report.status="error".into();report.reason=Some(format!("{error:#}"));report.saving_bytes=0;},Err(_)=>{report.status="error".into();report.reason=Some("encoder panicked; source was not intentionally removed; inspect any recovery message".into());report.saving_bytes=0;}}
-  report.elapsed_ms=started.elapsed().as_millis() as u64;report
- }).collect::<Vec<_>>());
+    let files = pool.install(|| {
+        scan.items.par_iter().map(|item| {
+            let started = Instant::now();
+            let mut report = base_report(item);
+            if let Some(reason) = &item.skip_reason {
+                report.reason = Some(reason.clone());
+                return report;
+            }
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                process(item, options, &selected_roots, &mut report)
+            }));
+            match outcome {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => {
+                    report.status = "error".into();
+                    report.reason = Some(format!("{error:#}"));
+                    report.saving_bytes = 0;
+                },
+                Err(_) => {
+                    report.status = "error".into();
+                    report.reason = Some("encoder panicked; inspect the file and any recovery message before retrying".into());
+                    report.saving_bytes = 0;
+                },
+            }
+            report.elapsed_ms = started.elapsed().as_millis() as u64;
+            report
+        }).collect::<Vec<_>>()
+    });
     let renames: Vec<_> = files
         .iter()
         .filter(|f| f.status == "written" || f.status == "planned")
@@ -294,6 +412,7 @@ pub fn run(options: &RunOptions) -> Result<Report> {
     };
     for f in &files {
         summary.original_bytes += f.original_bytes;
+        summary.cache_hits += usize::from(f.cache_hit);
         summary.saving_bytes += f.saving_bytes;
         summary.optimized_bytes += f.original_bytes - f.saving_bytes;
         match f.status.as_str() {
@@ -312,7 +431,7 @@ pub fn run(options: &RunOptions) -> Result<Report> {
         }
         .into(),
         presets_calibrated: false,
-        cache_enabled: false,
+        cache_enabled: options.use_cache && options.mode != Mode::Analyze,
         files,
         summary,
         renames,
@@ -320,18 +439,50 @@ pub fn run(options: &RunOptions) -> Result<Report> {
         warnings,
     })
 }
-fn process(item: &scanner::ScanItem, options: &RunOptions, report: &mut FileReport) -> Result<()> {
+fn process(
+    item: &scanner::ScanItem,
+    options: &RunOptions,
+    selected_roots: &[PathBuf],
+    report: &mut FileReport,
+) -> Result<()> {
     let snapshot = SourceSnapshot::capture(&item.source)?;
     report.original_bytes = snapshot.bytes().len() as u64;
     let settings = options
         .config
         .effective(&item.relative_path, &options.cli_settings)?;
     let min_bytes = settings.min_bytes.unwrap_or(2048);
+    let image_options = settings.optimize_options(item.is_asset)?;
+    let selected_root = selected_roots
+        .iter()
+        .filter(|root| item.source.starts_with(root))
+        .max_by_key(|root| root.components().count());
+    if options.use_cache && options.mode != Mode::Analyze {
+        let key = crate::cache::OutputKey::new(
+            snapshot.hash(),
+            report.original_bytes,
+            &image_options,
+            min_bytes,
+        )?;
+        for root in crate::cache::lookup_roots(&item.source, selected_root.map(PathBuf::as_path)) {
+            let cached = crate::cache::ProcessedCache::new(&root, crate::cache::Access::ReadOnly)
+                .and_then(|cache| cache.contains(&key));
+            match cached {
+                Ok(true) => {
+                    report.cache_hit = true;
+                    report.reason=Some("already processed: exact output bytes and effective settings match a local marker (not a new quality measurement)".into());
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(error) => report
+                    .warnings
+                    .push(format!("cache lookup ignored: {error:#}")),
+            }
+        }
+    }
     if report.original_bytes < min_bytes {
         report.reason = Some(format!("smaller than min_bytes ({min_bytes})"));
         return Ok(());
     }
-    let image_options = settings.optimize_options(item.is_asset)?;
     if item.is_asset {
         report.warnings.push(
             "assets path: format conversion disabled to protect filename-based access".into(),
@@ -408,6 +559,26 @@ fn process(item: &scanner::ScanItem, options: &RunOptions, report: &mut FileRepo
             options.output.is_some(),
         )?;
         report.status = "written".into();
+        if options.use_cache {
+            let root = options.output.as_ref().or(selected_root);
+            if let Some(root) = root {
+                let recorded = (|| -> Result<()> {
+                    let key = crate::cache::OutputKey::new(
+                        blake3::hash(&candidate.bytes),
+                        candidate.bytes.len() as u64,
+                        &image_options,
+                        min_bytes,
+                    )?;
+                    crate::cache::ProcessedCache::new(root, crate::cache::Access::ReadWrite)?
+                        .record(&key)
+                })();
+                if let Err(error) = recorded {
+                    report.warnings.push(format!(
+                        "image was written, but processed marker could not be saved: {error:#}"
+                    ));
+                }
+            }
+        }
     } else {
         report.status = "planned".into();
     }

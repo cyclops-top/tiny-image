@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, BufRead, Write},
     path::PathBuf,
     process::ExitCode,
 };
@@ -16,7 +16,7 @@ use tinyimg_core::{
     name = "tinyimg",
     version,
     about = "Offline perceptual image optimization for Android/App resources",
-    after_help = "WARNING: default mode modifies originals. Start with --dry-run or -o out/.\nPreset scores are experimental, not visually calibrated. AVIF is not available in this build."
+    after_help = "WARNING: default mode modifies originals. Directory inputs require confirmation [y/N].\nUse --dry-run or -o out/ to avoid replacing originals.\nPreset scores are experimental, not visually calibrated. AVIF is opt-in; external AVIF input is not decoded."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -76,7 +76,7 @@ struct OptimizeArgs {
     check: bool,
     #[arg(long)]
     jobs: Option<usize>,
-    /// Reserved for cache compatibility; this release always recomputes results.
+    /// Bypass processed-output markers and recompute candidates; never writes cache.
     #[arg(long)]
     no_cache: bool,
     #[arg(long, value_enum, default_value = "text")]
@@ -201,7 +201,14 @@ fn optimize(mut args: OptimizeArgs, analyze: bool) -> CliResult {
         if let Some(path) = config_path {
             eprintln!("configuration: {}", path.display());
         }
-        eprintln!("workers: {jobs}; cache: disabled (not implemented)");
+        eprintln!(
+            "workers: {jobs}; processed-output markers: {}",
+            if args.no_cache || analyze {
+                "disabled"
+            } else {
+                "enabled"
+            }
+        );
     }
     let options = RunOptions {
         inputs: paths,
@@ -211,8 +218,33 @@ fn optimize(mut args: OptimizeArgs, analyze: bool) -> CliResult {
         backup: args.backup,
         mode,
         jobs,
+        use_cache: !args.no_cache,
     };
-    let report = tinyimg_core::run(&options).map_err(|e| (1, e))?;
+    let prepared = tinyimg_core::prepare(&options).map_err(|e| (1, e))?;
+    if prepared.requires_confirmation() {
+        let eligible_images = prepared.eligible_images();
+        let known_skipped = prepared.known_skipped();
+        if !confirm_directory_replacement(eligible_images, known_skipped)
+            .map_err(|e| (1, e.into()))?
+        {
+            eprintln!("Cancelled; no files changed.");
+            // Cancellation must never create --report-file, but JSON callers
+            // still receive machine-readable stdout rather than prompt text.
+            if matches!(args.report, ReportFormat::Json) {
+                write_stdout(&format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "cancelled": true,
+                        "eligible_images": eligible_images,
+                        "known_skipped": known_skipped,
+                        "reason": "directory replacement not confirmed",
+                    })
+                ))?;
+            }
+            return Ok(0);
+        }
+    }
+    let report = prepared.run().map_err(|e| (1, e))?;
     let rendered = match args.report {
         ReportFormat::Json => {
             serde_json::to_string_pretty(&report).map_err(|e| (1, e.into()))? + "\n"
@@ -247,6 +279,22 @@ fn optimize(mut args: OptimizeArgs, analyze: bool) -> CliResult {
         0
     })
 }
+/// An empty line, EOF, or anything other than y/yes is a safe cancellation.
+fn confirm_directory_replacement(eligible_images: usize, known_skipped: usize) -> io::Result<bool> {
+    let mut stderr = io::stderr().lock();
+    write!(
+        stderr,
+        "Found {eligible_images} eligible image(s) after filtering; {known_skipped} known skipped item(s). Originals may be replaced or removed. Continue in place? [y/N] "
+    )?;
+    stderr.flush()?;
+    let mut response = String::new();
+    io::stdin().lock().read_line(&mut response)?;
+    Ok(matches!(
+        response.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 fn refs(args: RefsArgs) -> CliResult {
     let inputs = if args.paths.is_empty() {
         vec![PathBuf::from(".")]

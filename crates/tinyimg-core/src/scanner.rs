@@ -104,9 +104,14 @@ pub fn scan(inputs: &[PathBuf], options: &ScanOptions) -> Result<ScanResult> {
     let mut items = Vec::new();
     let mut destinations = BTreeMap::<PathBuf, PathBuf>::new();
     for file in files {
-        if (!options.include.is_empty() && !matches(&include, &file.relative))
-            || matches(&exclude, &file.relative)
-        {
+        let filter_reason = if !options.include.is_empty() && !matches(&include, &file.relative) {
+            Some("explicit input does not match configured include patterns".to_owned())
+        } else if matches(&exclude, &file.relative) {
+            Some("explicit input matches configured exclude patterns".to_owned())
+        } else {
+            None
+        };
+        if filter_reason.is_some() && !file.explicit {
             continue;
         }
         let extension = extension(&file.path);
@@ -120,7 +125,9 @@ pub fn scan(inputs: &[PathBuf], options: &ScanOptions) -> Result<ScanResult> {
             r.resource_name.starts_with("ic_launcher")
                 || launcher_resources.contains(&(r.resource_type.clone(), r.resource_name.clone()))
         });
-        let skip_reason = if file
+        let skip_reason = if filter_reason.is_some() {
+            filter_reason
+        } else if file
             .path
             .file_name()
             .and_then(|n| n.to_str())
@@ -358,11 +365,6 @@ fn excluded_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
 fn excluded(path: &Path, excluded_dirs: &[PathBuf]) -> bool {
     excluded_dirs.iter().any(|dir| path.starts_with(dir))
-        || path.components().any(|component| {
-            IGNORED_DIRS
-                .iter()
-                .any(|name| component.as_os_str() == *name)
-        })
 }
 
 fn discover(
@@ -380,7 +382,16 @@ fn discover(
         let metadata = fs::symlink_metadata(input)
             .with_context(|| format!("cannot inspect input {}", input.display()))?;
         if metadata.file_type().is_symlink() {
-            continue;
+            bail!(
+                "explicit input is a symlink and will not be followed: {}",
+                input.display()
+            );
+        }
+        if !metadata.is_file() && !metadata.is_dir() {
+            bail!(
+                "explicit input is not a regular file or directory: {}",
+                input.display()
+            );
         }
         let canonical = fs::canonicalize(input)
             .with_context(|| format!("cannot resolve input {}", input.display()))?;
@@ -393,7 +404,10 @@ fn discover(
     let mut files = Vec::new();
     for (root, explicit) in roots {
         if excluded(&root, &excluded_dirs) {
-            continue;
+            bail!(
+                "explicit input lies in an excluded output or backup directory: {}",
+                root.display()
+            );
         }
         let base = if explicit {
             root.parent().unwrap_or(&root)
@@ -418,8 +432,18 @@ fn discover(
                 if entry.file_type().is_symlink() || excluded(entry.path(), &excluded_dirs) {
                     return false;
                 }
-                // Excluded directory globs prune entire trees. Include globs never do.
-                !entry.file_type().is_dir()
+                // Built-in directory exclusions apply only to descendants of the
+                // selected root, not its ancestors or the explicitly chosen root.
+                // In particular, `tinyimg image.png` inside target/release works.
+                if entry.depth() > 0
+                    && entry.file_type().is_dir()
+                    && IGNORED_DIRS.iter().any(|name| entry.file_name() == *name)
+                {
+                    return false;
+                }
+                // Excluded directory globs prune descendant trees. Include globs never do.
+                entry.depth() == 0
+                    || !entry.file_type().is_dir()
                     || !exclude_globs.is_some_and(|globs| matches(globs, &relative(entry.path())))
             })
         {
@@ -1015,9 +1039,9 @@ mod tests {
         assert_eq!(result.items.len(), 1);
         assert!(
             scan(&[dir.path().join("alias.png")], &ScanOptions::default())
-                .unwrap()
-                .items
-                .is_empty()
+                .unwrap_err()
+                .to_string()
+                .contains("symlink")
         );
     }
 }

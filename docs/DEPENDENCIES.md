@@ -11,6 +11,13 @@
 | mozjpeg | 0.10.13 | IJG | JPEG 编码接口 |
 | mozjpeg-sys | 2.2.3 | IJG AND Zlib AND BSD-3-Clause | 内置原生 JPEG 编码库 |
 | ssimulacra2 | 0.5.1 | BSD-2-Clause | 感知质量评分 |
+| ravif | 0.13.0 | BSD-3-Clause | 真正的 AVIF 编码，关闭 assembly/threading 特性 |
+| rav1e | 0.8.1 | BSD-2-Clause | Rust AV1 编码器 |
+| avif-decode | 3.0.0（本地微小补丁） | BSD-3-Clause | 仅重新解码本次生成的 AVIF 候选 |
+| rav1d | 1.1.0 | BSD-2-Clause | Rust AV1 解码器，关闭 assembly |
+| avif-parse | 2.1.0 | MPL-2.0 | AVIF 容器及候选尺寸预检 |
+| to_method | 1.1.0 | CC0-1.0 | AVIF 容器解析器的辅助方法 |
+| libfuzzer-sys | 0.4.13 | NCSA | 锁文件中 rav1e 的可选 fuzz 依赖，默认运行时未启用 |
 | libdeflate-sys | 1.26.1 | Apache-2.0 | 原生绑定；内置 libdeflate 另有 MIT 许可 |
 
 版本与声明核对自本次 Cargo 下载后的各 crate `Cargo.toml`，最终版本以 [Cargo.lock](../Cargo.lock) 为准。可以通过 [crates.io](https://crates.io/) 按精确名称与版本查看相应源码；不能仅根据包装库的许可证推断其内置 C 库的许可。
@@ -55,3 +62,9 @@ python scripts/sanitize_license_inventory.py
 本文件是工程清单，不是法律意见；许可证原文和你的实际分发方式决定具体义务。
 
 本次 Linux 验证中，cargo-deny 0.20.2 的 licenses/sources 检查已通过，cargo-about 0.9.2 已成功生成仓库根目录 THIRD-PARTY-LICENSES.json。详见 [验证记录](VALIDATION.md)。
+
+## AVIF 候选验证的本地补丁
+
+[avif-decode 补丁与来源记录](../vendor/avif-decode/TINYIMG-PATCHES.md) 记录官方 crates.io 归档及 SHA-256、保留源码范围和两处改动：关闭 x86 assembly、将解码器线程数限制为 1。原始 BSD 许可证随源码保留；没有用模拟解码或原图自比较替代验证。AVIF 编码及质量验证以全局互斥锁串行执行，输入上限为 400 万像素，8 位 SDR 输入编码为 10 位 4:4:4 AVIF，解码至完整 u16 范围后舍入回现有 RGBA8 评分域。
+
+Rust 最低版本提升至 1.98，来自 avif-decode 3.0.0 的真实 MSRV 要求。外部 AVIF 输入仍明确拒绝：上游 rav1d 1.1.0 存在损坏 AV1 码流触发进程终止的已知路径，不能通过 catch_unwind 防护；此处解码器仅处理当前进程刚编码的候选，不应复用来读取缓存中的任意文件。

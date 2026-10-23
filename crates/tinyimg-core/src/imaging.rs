@@ -8,6 +8,7 @@ use std::{
     collections::HashSet,
     io::Cursor,
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Mutex, MutexGuard},
 };
 
 const MAX_DIMENSION: u32 = 8000;
@@ -15,6 +16,11 @@ const MAX_DIMENSION: u32 = 8000;
 const MAX_PIXELS: u64 = 16_000_000;
 const MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 const SEARCH_ATTEMPTS: usize = 8;
+// rav1e keeps several full image planes. Bound both its workload and concurrency,
+// independently of the caller's image-level worker pool.
+const MAX_AVIF_PIXELS: u64 = 4_000_000;
+static AVIF_WORK: Mutex<()> = Mutex::new(());
+const AVIF_INPUT_REJECTION: &str = "external AVIF input is not supported: the decoder is limited to freshly encoded candidates because upstream rav1d 1.1 can abort on corrupt AV1 data";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -152,6 +158,7 @@ pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimiz
         ImageFormat::Png => Format::Png,
         ImageFormat::WebP => Format::Webp,
         ImageFormat::Jpeg => Format::Jpeg,
+        ImageFormat::Avif => return Err(AVIF_INPUT_REJECTION.into()),
         _ => {
             return Err(
                 "unsupported input format (only static PNG, WebP and JPEG are decoded)".into(),
@@ -205,12 +212,6 @@ pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimiz
     }
     if let Some(reason) = &limited {
         result.warnings.push(reason.clone());
-    }
-    if options.formats.contains(&Format::Avif) {
-        result.warnings.push(
-            "AVIF is explicitly unsupported in this build: no verified AVIF encode/decode path"
-                .into(),
-        );
     }
     if options.metadata == MetadataPolicy::Keep && source_format != Format::Png {
         result.skip_reason = Some(
@@ -282,6 +283,15 @@ pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimiz
                 .push("JPEG skipped: source has non-opaque pixels".into());
         } else if lossy_allowed {
             search_codec(Codec::Jpeg, &source, &mut result, &mut feasible);
+        }
+    }
+    if allowed(Format::Avif) && lossy_allowed {
+        if u64::from(width) * u64::from(height) > MAX_AVIF_PIXELS {
+            result.warnings.push(format!(
+                "AVIF skipped: maximum {MAX_AVIF_PIXELS} pixels for bounded encoder memory"
+            ));
+        } else {
+            search_codec(Codec::Avif, &source, &mut result, &mut feasible);
         }
     }
     result.runtime_error = all_candidates_failed(&result.candidates);
@@ -456,7 +466,7 @@ fn inspect_container(input: &[u8], format: Format) -> Result<Restrictions, Strin
                 p += len;
             }
         }
-        Format::Avif => r.skip = Some("AVIF input is not supported".into()),
+        Format::Avif => r.skip = Some(AVIF_INPUT_REJECTION.into()),
     }
     Ok(r)
 }
@@ -529,6 +539,7 @@ enum Codec {
     WebpLossless,
     WebpLossy,
     Jpeg,
+    Avif,
 }
 impl Codec {
     fn name(self) -> &'static str {
@@ -538,6 +549,7 @@ impl Codec {
             Self::WebpLossless => "webp-lossless",
             Self::WebpLossy => "webp-lossy",
             Self::Jpeg => "mozjpeg",
+            Self::Avif => "ravif",
         }
     }
     fn format(self) -> Format {
@@ -545,6 +557,7 @@ impl Codec {
             Self::PngLossless | Self::PngQuant => Format::Png,
             Self::WebpLossless | Self::WebpLossy => Format::Webp,
             Self::Jpeg => Format::Jpeg,
+            Self::Avif => Format::Avif,
         }
     }
     fn lossless(self) -> bool {
@@ -681,6 +694,7 @@ fn encode_codec(codec: Codec, rgba: &RgbaImage, quality: Option<u8>) -> Result<V
                 .map(|b| b.to_vec())
                 .map_err(|e| format!("WebP encoding failed: {e:?}"))
         }
+        Codec::Avif => encode_avif(rgba, q),
         Codec::Jpeg => {
             // MozJPEG signals some codec errors by unwinding, per its API.
             catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, String> {
@@ -698,6 +712,141 @@ fn encode_codec(codec: Codec, rgba: &RgbaImage, quality: Option<u8>) -> Result<V
             .map_err(|_| "MozJPEG encoder panicked".to_string())?
         }
     }
+}
+
+fn avif_work() -> Result<MutexGuard<'static, ()>, String> {
+    AVIF_WORK
+        .lock()
+        .map_err(|_| "AVIF worker lock poisoned; restart before retrying".into())
+}
+
+fn avif_dimensions(width: u32, height: u32) -> Result<(), String> {
+    if width == 0
+        || height == 0
+        || width > MAX_DIMENSION
+        || height > MAX_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_AVIF_PIXELS
+    {
+        return Err(format!(
+            "AVIF exceeds safety limits: maximum side {MAX_DIMENSION}, maximum pixels {MAX_AVIF_PIXELS}"
+        ));
+    }
+    Ok(())
+}
+
+fn encode_avif(rgba: &RgbaImage, quality: u8) -> Result<Vec<u8>, String> {
+    avif_dimensions(rgba.width(), rgba.height())?;
+    let _work = avif_work()?;
+    let pixels: Vec<_> = rgba
+        .pixels()
+        .map(|p| ravif::RGBA8::new(p[0], p[1], p[2], p[3]))
+        .collect();
+    let encoded = ravif::Encoder::new()
+        .with_quality(f32::from(quality.clamp(1, 100)))
+        .with_alpha_quality(100.0)
+        .with_speed(6)
+        .with_num_threads(Some(1))
+        .with_bit_depth(ravif::BitDepth::Ten)
+        .with_alpha_color_mode(ravif::AlphaColorMode::UnassociatedDirty)
+        .encode_rgba(ravif::Img::new(
+            &pixels[..],
+            rgba.width() as usize,
+            rgba.height() as usize,
+        ))
+        .map_err(|e| format!("AVIF encoding failed: {e}"))?;
+    if encoded.avif_file.len() as u64 > MAX_DECODE_BYTES {
+        return Err("encoded AVIF exceeds byte safety limit".into());
+    }
+    Ok(encoded.avif_file)
+}
+
+/// Only called on bytes produced by encode_avif in the current optimization.
+/// The caller holds AVIF_WORK through decode and scoring; this function must not
+/// lock again. Never use for arbitrary inputs or externally supplied cache data.
+fn decode_generated_avif_locked(
+    bytes: &[u8],
+    expected: (u32, u32),
+) -> Result<DynamicImage, String> {
+    avif_dimensions(expected.0, expected.1)?;
+    if bytes.len() as u64 > MAX_DECODE_BYTES {
+        return Err("AVIF candidate exceeds byte safety limit".into());
+    }
+    // Parse bounded metadata before allocating decoder planes. Both primary and
+    // alpha streams must describe the dimensions of this in-process source.
+    let parsed = avif_parse::read_avif(&mut Cursor::new(bytes))
+        .map_err(|e| format!("AVIF candidate header: {e}"))?;
+    let primary = parsed
+        .primary_item_metadata()
+        .map_err(|e| format!("AVIF candidate metadata: {e}"))?;
+    let alpha = parsed
+        .alpha_item_metadata()
+        .map_err(|e| format!("AVIF alpha metadata: {e}"))?;
+    for metadata in std::iter::once(primary).chain(alpha) {
+        let dimensions = (
+            metadata.max_frame_width.get(),
+            metadata.max_frame_height.get(),
+        );
+        avif_dimensions(dimensions.0, dimensions.1)?;
+        if dimensions != expected || !metadata.still_picture {
+            return Err("AVIF candidate dimensions changed or stream is not a still image".into());
+        }
+    }
+    drop(parsed);
+    let decoded = avif_decode::Decoder::from_avif(bytes)
+        .and_then(avif_decode::Decoder::to_image)
+        .map_err(|e| format!("AVIF candidate decoding failed: {e}"))?;
+    let scale16 = |v: u16| ((u32::from(v) + 128) / 257) as u8;
+    // avif-decode expands 10/12-bit samples to full-range u16. Round to the
+    // existing RGBA8 metric domain; never interpret them as native 10-bit values.
+    let (width, height, pixels): (usize, usize, Vec<u8>) = match decoded {
+        avif_decode::Image::Rgb8(i) => (
+            i.width(),
+            i.height(),
+            i.pixels().flat_map(|p| [p.r, p.g, p.b, 255]).collect(),
+        ),
+        avif_decode::Image::Rgba8(i) => (
+            i.width(),
+            i.height(),
+            i.pixels().flat_map(|p| [p.r, p.g, p.b, p.a]).collect(),
+        ),
+        avif_decode::Image::Rgb16(i) => (
+            i.width(),
+            i.height(),
+            i.pixels()
+                .flat_map(|p| [scale16(p.r), scale16(p.g), scale16(p.b), 255])
+                .collect(),
+        ),
+        avif_decode::Image::Rgba16(i) => (
+            i.width(),
+            i.height(),
+            i.pixels()
+                .flat_map(|p| [scale16(p.r), scale16(p.g), scale16(p.b), scale16(p.a)])
+                .collect(),
+        ),
+        avif_decode::Image::Gray8(i) => (
+            i.width(),
+            i.height(),
+            i.pixels()
+                .flat_map(|p| [p.value(), p.value(), p.value(), 255])
+                .collect(),
+        ),
+        avif_decode::Image::Gray16(i) => (
+            i.width(),
+            i.height(),
+            i.pixels()
+                .flat_map(|p| {
+                    let g = scale16(p.value());
+                    [g, g, g, 255]
+                })
+                .collect(),
+        ),
+    };
+    if (width, height) != (expected.0 as usize, expected.1 as usize) {
+        return Err("AVIF decoded candidate dimensions changed".into());
+    }
+    RgbaImage::from_raw(expected.0, expected.1, pixels)
+        .map(DynamicImage::ImageRgba8)
+        .ok_or_else(|| "AVIF decoder returned an invalid pixel buffer".into())
 }
 
 fn record_candidate(
@@ -858,7 +1007,18 @@ fn quality_search(target: f64, mut evaluate: impl FnMut(u8) -> Option<f64>) -> V
 
 fn verify(source: &Source<'_>, bytes: &[u8], lossless: bool) -> Result<Option<f64>, String> {
     let format = image::guess_format(bytes).map_err(|e| e.to_string())?;
-    let candidate = decode(bytes, format)?;
+    // Only this private candidate path may decode AVIF. External inputs are
+    // rejected before reaching any decoder; the lock also bounds metric RAM.
+    let _avif_work = if format == ImageFormat::Avif {
+        Some(avif_work()?)
+    } else {
+        None
+    };
+    let candidate = if format == ImageFormat::Avif {
+        decode_generated_avif_locked(bytes, source.decoded.dimensions())?
+    } else {
+        decode(bytes, format)?
+    };
     if candidate.dimensions() != source.decoded.dimensions() {
         return Err("candidate dimensions changed".into());
     }
@@ -1286,17 +1446,139 @@ mod tests {
         assert!(result.skip_reason.unwrap().contains("orientation"));
     }
     #[test]
-    fn avif_is_explicitly_reported_not_fake_encoded() {
-        let bytes = encode_png(&fixture(8, 8, false)).unwrap();
-        let result = optimize_bytes(&bytes, &options(vec![Format::Avif])).unwrap();
-        assert!(result.selected.is_none());
-        assert!(result.candidates.is_empty());
+    fn avif_candidates_are_real_and_meet_measured_threshold() {
+        let rgba = fixture(32, 32, false);
+        // An uncompressed valid PNG gives the selection test a reliable size
+        // improvement without assuming AVIF beats every already-compressed PNG.
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, rgba.width(), rgba.height());
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::NoCompression);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(rgba.as_raw()).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut opts = options(vec![Format::Avif]);
+        opts.score = 70.0;
+        opts.min_saving = 0.0;
+        let result = optimize_bytes(&bytes, &opts).unwrap();
+        assert!(!result.candidates.is_empty());
         assert!(
             result
-                .warnings
+                .candidates
                 .iter()
-                .any(|w| w.contains("AVIF") && w.contains("unsupported"))
+                .all(|c| c.encoder == "ravif" && c.format == Format::Avif && !c.lossless)
         );
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.accepted && c.score.is_some_and(|s| s >= opts.score))
+        );
+        let selected = result
+            .selected
+            .expect("fixture should have a smaller verified AVIF");
+        assert_eq!(
+            image::guess_format(&selected.bytes).unwrap(),
+            ImageFormat::Avif
+        );
+        assert!(selected.bytes.len() < bytes.len());
+        assert!(selected.summary.score.unwrap() >= opts.score);
+        let decoded = DynamicImage::ImageRgba8(rgba.clone());
+        let source = Source {
+            decoded: &decoded,
+            rgba: &rgba,
+            has_alpha: false,
+            tiny: false,
+            target: opts.score,
+        };
+        let measured = verify(&source, &selected.bytes, false).unwrap().unwrap();
+        assert!((measured - selected.summary.score.unwrap()).abs() < 1e-8);
+        assert!(
+            measured < 100.0,
+            "lossy AVIF must be scored, not assigned an identity score"
+        );
+    }
+    #[test]
+    fn avif_alpha_ten_bit_decode_and_dimensions_are_verified() {
+        let rgba = fixture(32, 24, true);
+        let bytes = encode_codec(Codec::Avif, &rgba, Some(95)).unwrap();
+        let parsed = avif_parse::read_avif(&mut bytes.as_slice()).unwrap();
+        assert_eq!(parsed.primary_item_metadata().unwrap().bit_depth, 10);
+        assert!(parsed.alpha_item.is_some());
+        let decoded = DynamicImage::ImageRgba8(rgba.clone());
+        let source = Source {
+            decoded: &decoded,
+            rgba: &rgba,
+            has_alpha: true,
+            tiny: false,
+            target: 70.0,
+        };
+        assert!(verify(&source, &bytes, false).unwrap().unwrap() >= 70.0);
+        let _work = avif_work().unwrap();
+        let candidate = decode_generated_avif_locked(&bytes, (32, 24)).unwrap();
+        assert_eq!(candidate.dimensions(), (32, 24));
+        let candidate = candidate.to_rgba8();
+        assert!(candidate.pixels().any(|p| p[3] < 255));
+        assert!(
+            candidate
+                .pixels()
+                .zip(rgba.pixels())
+                .all(|(a, b)| a[3] == b[3])
+        );
+        assert!(
+            decode_generated_avif_locked(&bytes, (31, 24))
+                .unwrap_err()
+                .contains("dimensions")
+        );
+    }
+    #[test]
+    fn avif_input_including_known_corrupt_payload_is_rejected_before_decode() {
+        // This is the upstream corruption regression that would abort rav1d if
+        // decoded. The public input boundary must reject it without touching AV1.
+        let mut bytes = include_bytes!("../../../vendor/avif-decode/tests/data/tiny.avif").to_vec();
+        assert_eq!(image::guess_format(&bytes).unwrap(), ImageFormat::Avif);
+        assert!(
+            optimize_bytes(&bytes, &OptimizeOptions::default())
+                .unwrap_err()
+                .contains("external AVIF")
+        );
+        bytes[280] ^= 1;
+        assert!(
+            optimize_bytes(&bytes, &OptimizeOptions::default())
+                .unwrap_err()
+                .contains("external AVIF")
+        );
+    }
+    #[test]
+    fn avif_limits_and_tiny_or_protected_sources_are_respected() {
+        assert!(avif_dimensions(0, 10).is_err());
+        assert!(avif_dimensions(8001, 8).is_err());
+        assert!(avif_dimensions(2001, 2000).is_err());
+        assert!(avif_dimensions(2000, 2000).is_ok());
+        let tiny = encode_png(&fixture(4, 4, true)).unwrap();
+        assert!(
+            optimize_bytes(&tiny, &options(vec![Format::Avif]))
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        let protected = png_with_chunk(&fixture(16, 16, false), *b"gAMA", &100000u32.to_be_bytes());
+        assert!(
+            optimize_bytes(&protected, &options(vec![Format::Avif]))
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        let input = encode_png(&fixture(16, 16, false)).unwrap();
+        let mut opts = options(vec![Format::Avif]);
+        opts.metadata = MetadataPolicy::Keep;
+        assert!(optimize_bytes(&input, &opts).unwrap().candidates.is_empty());
+        opts.metadata = MetadataPolicy::Default;
+        opts.keep_format = true;
+        assert!(optimize_bytes(&input, &opts).unwrap().candidates.is_empty());
     }
     #[test]
     fn corrupt_input_is_rejected() {

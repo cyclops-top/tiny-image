@@ -1,4 +1,5 @@
 //! Offline, quality-targeted image optimization with conservative file safety.
+pub mod cache;
 pub mod config;
 pub mod imaging;
 pub mod paths;

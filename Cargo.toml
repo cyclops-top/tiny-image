@@ -3,9 +3,9 @@ members = ["crates/tinyimg-core", "crates/tinyimg-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.98"
 license = "GPL-3.0-or-later"
 authors = ["tinyimg contributors"]
 repository = "https://github.com/cyclops-top/tiny-image"
@@ -21,3 +21,14 @@ tempfile = "3.23"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Portable candidate-only AVIF verification; see vendor/avif-decode/TINYIMG-PATCHES.md.
+[patch.crates-io]
+avif-decode = { path = "vendor/avif-decode" }
+
+[profile.dev.package.rav1d]
+opt-level = 2
+debug-assertions = false
+
+[profile.dev.package.rav1e]
+opt-level = 2

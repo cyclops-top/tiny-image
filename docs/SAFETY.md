@@ -4,6 +4,8 @@
 
 **默认运行会原地替换文件；跨格式转换成功后会删除旧扩展名的源文件。** 首次运行应使用 `--dry-run` 或 `analyze`。正式处理前提交版本控制，或使用独立备份。推荐先用 `-o` 生成待审查结果，再在实际应用、不同密度和深浅主题下检查。
 
+目录原地写入（包括 `--backup`）必须先确认：完成只读扫描及筛选后显示候选图片数量，提示 `[y/N]`，默认取消。只有 `y` / `yes` 才继续；回车、EOF 或其他回答不会写图片、缓存、备份和报告。`--quiet` 不会取消此保护。输出目录模式、只读模式、仅文件输入和零候选不询问。确认数量是符合扫描与最小大小规则的图片数，不是保证能优化的数量；执行沿用已确认的文件清单。
+
 程序会尽力避免破坏源文件，但任何程序都无法保证在硬件故障、进程被杀、并发修改、恶意目录替换或文件系统异常时绝对安全。没有经过恢复演练的备份不应被当作唯一保障。
 
 ## 只读模式
@@ -57,7 +59,7 @@ JPEG 不用于含透明像素的图片。动画、nine-patch、启动图标、�
 
 图片编码和评分可能消耗较多 CPU/内存。`--jobs` 增大并行度会提高同时在内存中的图片数量。输入文件上限 256 MiB、最大边 8000、1600 万像素上限与常规解码错误处理不能代替对恶意输入的安全沙箱；不要用高权限身份处理不可信的图片集合。
 
-应用运行无需联网；从源码构建及安装依赖通常需要网络。当前没有增量缓存，因此重复分析会重新编码。错误输入会在报告中呈现，批量任务的最终退出码仍需检查。
+应用运行无需联网；从源码构建及安装依赖通常需要网络。默认使用仅保存内容哈希/有效设置/版本的已处理输出标记；`analyze` 始终重新编码，`--no-cache` 绕过标记读写。错误输入会在报告中呈现，批量任务的最终退出码仍需检查。
 
 ## Native paths and selected roots
 
@@ -69,4 +71,8 @@ Unicode paths remain strings in JSON. Non-Unicode paths use an object containing
 
 ## Repeated lossy processing
 
-This baseline has no persistent processed-image marker or incremental cache. Running it repeatedly can recompress a prior lossy result relative to that result and accumulate quality loss. Retain originals, prefer `-o` into a fresh directory, and rerun from the originals rather than repeatedly applying in-place lossy processing. `--check` and `analyze` measure the supplied files, not an unavailable original generation.
+The default processed-output marker skips exact prior outputs under the same effective settings and encoder version. It does not store image bytes or trust historical quality scores. Changing settings, bypassing/missing markers, or moving outputs can still recompress a prior lossy result and accumulate quality loss. Retain originals, prefer `-o` into a fresh directory, and rerun from the originals rather than repeatedly applying in-place lossy processing. `--check` and `analyze` measure the supplied files, not an unavailable original generation.
+
+## AVIF output scope
+
+AVIF is opt-in output (`--formats avif`), at most 4 million pixels. ravif uses SDR 4:4:4 encoding; fresh in-process candidate bytes are decoded and scored before selection. AVIF work is globally serialized and decoder threads are capped at one. The decoder is never called for external files or cached image bytes. Upstream rav1d has a documented malformed-input abort path that cannot be caught by Rust unwinding, so arbitrary AVIF inputs are explicitly skipped, including our own outputs on a later scan. Those skips are not counted as cache hits. See `vendor/avif-decode/TINYIMG-PATCHES.md`.

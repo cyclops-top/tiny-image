@@ -26,6 +26,9 @@ imagequant = "=4.4.1"
 webp = "=0.3.1"
 ssimulacra2 = "=0.5.1"
 mozjpeg = { version = "=0.10.13", default-features = false }
+ravif = { version = "=0.13.0", default-features = false }
+avif-decode = { version = "=3.0.0", default-features = false }
+avif-parse = "=2.1.0"
 
 [dev-dependencies]
 tempfile.workspace = true

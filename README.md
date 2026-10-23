@@ -2,9 +2,9 @@
 
 **离线、目标质量驱动的图片优化命令行工具，优先面向 Android/App 资源图。**
 
-给出质量目标，tinyimg 在 PNG、WebP 和可选 JPEG 候选中搜索并验证，保留满足规则且更小的结果。核心使用真实 SSIMULACRA2，不用 PSNR 或文件大小冒充感知评分。它不是 TinyPNG 服务的客户端，也不上传图片。
+给出质量目标，tinyimg 在 PNG、WebP 和可选 JPEG/AVIF 候选中搜索并验证，保留满足规则且更小的结果。核心使用真实 SSIMULACRA2，不用 PSNR 或文件大小冒充感知评分。它不是 TinyPNG 服务的客户端，也不上传图片。
 
-> 开发预览 0.1.0。预设尚未经过真实素材的人眼校准，不能保证“肉眼无损”。默认原地写回会替换原图，转格式会删除旧文件。先用 `--dry-run`、`analyze` 或 `-o`，并保留版本控制/备份。
+> 开发预览 0.2.0。预设尚未经过真实素材的人眼校准，不能保证“肉眼无损”。默认原地写回会替换原图，转格式会删除旧文件。先用 `--dry-run`、`analyze` 或 `-o`，并保留版本控制/备份。
 
 [源码](https://github.com/cyclops-top/tiny-image) · [文件安全](docs/SAFETY.md) · [参与开发](CONTRIBUTING.md) · [依赖与许可](docs/DEPENDENCIES.md) · [更新记录](CHANGELOG.md)
 
@@ -13,18 +13,20 @@
 - `tinyimg-core` 库与 `tinyimg` CLI；离线批处理和有界图片级并行。
 - PNG 无损优化（oxipng 10.2.1）、PNG 量化（imagequant 4.4.1）。
 - WebP 无损/有损（webp 0.3.1），显式启用的 JPEG（MozJPEG 0.10.13，仅不透明图）。
+- 可选 AVIF（ravif 0.13.0）：本进程生成的候选由真实 AV1 解码器回验；限 SDR、400 万像素、串行处理，不要求 NASM。
+- 已处理输出的持久标记：内容哈希、有效设置与编码器版本完全匹配时跳过重复处理。
 - SSIMULACRA2 0.5.1；透明图分别合成到黑、白底，取较低分。每个最终候选重新解码验收。
 - Android 资源密度分组及限定符信息；各密度独立处理。nine-patch、启动图标、XML、动画及其他不适用输入保守跳过。
 - 默认尝试 PNG/WebP；`assets` 路径保留格式；冲突目标不覆盖。改名清单及写死文件名的引用警告，不自动改源码。
 - `analyze`、`refs`、`init`、dry-run、CI 检查、输出目录、非覆盖备份、TOML 配置和 JSON 报告。
 
-当前不支持 AVIF、GIF/SVG/视频/动画处理、自动缩放、GUI、增量缓存或完整 ICC/EXIF 色彩/方向转换。AVIF 会明确报告未实现，不会伪称已编码。带复杂色彩/方向/高位深信息的图片会限制为安全无损路径或跳过。
+当前不支持外部 AVIF 输入、GIF/SVG/视频/动画处理、自动缩放、GUI、完整候选结果缓存或完整 ICC/EXIF 色彩/方向转换。AVIF 是输出候选，不是通用 AVIF 转换器；为避开上游已知恶意输入崩溃路径，不解码用户提供的任意 AVIF。带复杂色彩/方向/高位深信息的图片会限制为安全无损路径或跳过。
 
 没有已发布的 crates.io 包、Homebrew 配方或安装包承诺。请从源码构建。默认 CI 只验证 Linux；macOS/Windows 保留可选手动验证入口，留待目标系统编译检查，不宣称已经实测通过。
 
 ## 从源码构建
 
-需要 Rust **1.88+**、Cargo，以及平台原生 C/C++ 工具链。WebP、MozJPEG、libdeflate 会从依赖源码编译。使用 Makefile 还需要 **GNU Make**，Windows 可在装有 GNU Make 的开发者终端中运行，不能用 `nmake` 替代。
+需要 Rust **1.98+**、Cargo，以及平台原生 C/C++ 工具链。WebP、MozJPEG、libdeflate 会从依赖源码编译。使用 Makefile 还需要 **GNU Make**，Windows 可在装有 GNU Make 的开发者终端中运行，不能用 `nmake` 替代。
 
 - Linux：GCC 或 Clang、常规开发头文件和链接器。
 - macOS：Xcode Command Line Tools、对应 macOS SDK。
@@ -111,6 +113,10 @@ tinyimg app/src/main/res --backup original-res/
 
 不传路径时，默认处理当前目录。单目录输入保留其相对层级；多目录输入增加各根目录名称前缀。无法无歧义映射到输出路径的输入会报错，不会静默合并。
 
+只要输入中包含目录（包括默认当前目录、文件与目录混合输入），原地写入前会先扫描筛选，显示符合条件的图片数量，再询问 `Continue in place? [y/N]`。只有输入 `y` 或 `yes`（不区分大小写）才继续；`n`、直接回车、其他内容或 stdin 结束均取消，退出码为 0，不修改图片、缓存、备份或报告文件。`--quiet` 不会隐藏安全确认。指定 `--output` / `-o`、只读模式、仅显式文件输入或筛选后无符合条件图片时不询问。
+
+数量按 include/exclude、支持的格式、受保护资源规则及有效 `min_bytes` 筛选；同时显示已确定跳过的扫描项数（不包含被目录过滤规则直接排除的项）；不保证每张最终都能优化，解码、已处理标记和质量/收益校验仍可能跳过。确认后沿用同一份文件清单，不把等待期间新加入的图片纳入处理。提示写到 stderr，不污染 JSON stdout；`--report json` 取消时输出包含 `cancelled: true`、`eligible_images` 和 `known_skipped` 的 JSON 对象，不创建 `--report-file`。
+
 ## 质量与格式
 
 ```sh
@@ -169,7 +175,7 @@ tinyimg refs . --report json
 tinyimg res -o optimized/ --report json --report-file tinyimg-report.json
 ```
 
-`--dry-run`、`analyze`、`--check` 严格不落盘，包括不写报告、缓存、备份或输出目录；与 `--report-file` 组合会报参数错误。若使用 shell 重定向，创建报告文件的是 shell。`--no-cache` 仅为兼容占位参数，当前始终重新计算。
+`--dry-run`、`analyze`、`--check` 严格不落盘，包括不写报告、缓存、备份或输出目录；与 `--report-file` 组合会报参数错误。若使用 shell 重定向，创建报告文件的是 shell。`--no-cache` 完全绕过已处理标记的读写；`analyze` 总是重新分析。默认原地写回成功后在所选输入根目录（单文件为其父目录）写 `.tinyimg-cache`，`-o` 只在输出根目录写标记，不修改输入树。标记不包含图片或质量分数，不是对旧候选字节的信任。损坏/不可读标记只报警并重新计算。
 
 | 退出码 | 含义 |
 | --- | --- |
@@ -178,7 +184,7 @@ tinyimg res -o optimized/ --report json --report-file tinyimg-report.json
 | 2 | 参数或配置错误 |
 | 3 | `--check` 找到可执行的优化项 |
 
-文本报告列出逐图结果、跳过原因和引用警告；`analyze` 或 `-v` 显示候选细节。JSON 包括 `files`、`summary`、`renames`、`reference_warnings`、`presets_calibrated: false` 和 `cache_enabled: false`。`-q` 抑制普通文本输出，JSON 仍输出。
+文本报告列出逐图结果、跳过原因和引用警告；`analyze` 或 `-v` 显示候选细节。JSON 包括 `files`、`summary`、`renames`、`reference_warnings`、`presets_calibrated: false` 和 `cache_enabled`、`summary.cache_hits`。`-q` 抑制普通文本输出，JSON 仍输出。
 
 引用检查只读取支持的 UTF-8 文本文件，单文件上限 2 MiB；不修改源码，不是静态分析器。优化后的引用检查最多向上查找 8 层，在最近的 AndroidManifest.xml 所在目录或 Git 边界停止，以覆盖资源目录旁的源码和 assets；找不到边界则只查输入目录。`tinyimg refs .` 可显式检查更大的项目范围。动态路径、外部文件和二进制引用仍可能遗漏。
 
@@ -190,11 +196,11 @@ tinyimg res -o optimized/ --report json --report-file tinyimg-report.json
 - `--keep-metadata` 当前仅允许 PNG 无损优化；其他输入保留原图。`--strip-all` 不会强行绕过方向/色彩保护。
 - 符号链接不会跟随；已存在的目标与备份不会静默覆盖。文件系统竞态、掉电及元数据复制边界见 [SAFETY.md](docs/SAFETY.md)。
 
-尚待完成：真实素材质量校准、全平台运行记录、性能基准、可选 AVIF、增量缓存及经过审查的发布流程。
+尚待完成：真实素材质量校准、全平台运行记录、性能基准、完整候选结果复用、外部 AVIF 安全导入及经过审查的发布流程。
 
 ## English summary
 
-tinyimg is an offline Rust image optimizer for Android/App resources. It searches PNG, WebP and optional JPEG candidates against real SSIMULACRA2 scores, then decodes and validates the final bytes. This is an experimental source release: AVIF and caching are not implemented, presets are uncalibrated, and complex color/orientation metadata is handled conservatively.
+tinyimg is an offline Rust image optimizer for Android/App resources. It searches PNG, WebP and optional JPEG/AVIF candidates against real SSIMULACRA2 scores, then decodes and validates the final bytes. This is an experimental source release: AVIF output is genuinely decoded and verified, arbitrary AVIF import is deliberately disabled, processed-output markers avoid same-settings repeat work, presets remain uncalibrated, and complex color/orientation metadata is handled conservatively.
 
 Default operation modifies originals and may change extensions. Start with `tinyimg analyze PATH`, `--dry-run`, or `-o OUT`; output directories contain optimized files only, not a complete mirror. `make release` builds natively; `TARGET=...` selects a real Rust target and requires the corresponding C toolchain/linker/SDK. No public package publication is implied.
 
@@ -204,4 +210,4 @@ GPL-3.0-or-later，见 [LICENSE](LICENSE)。本项目依赖的第三方组件另
 
 非 Unicode 文件名也不会让 JSON 报告在写回后失败：正常路径是 JSON 字符串，无法表示为 Unicode 的路径改为带 `encoding`、`hex`、`display` 的对象，完整保存操作系统原始路径。详见 [安全说明](docs/SAFETY.md)。显式指定的输出/备份根目录会先解析系统路径别名（例如 macOS `/var`）；该根目录下面的符号链接仍会被拒绝。
 
-本次 Linux 编译与 87 项测试记录见 [验证记录](docs/VALIDATION.md)。注意：当前没有“已处理图片”持久标记，反复对有损输出原地执行可能累积质量损失；建议保留原图并每次从原图使用 `-o` 输出。
+本次 Linux 编译与完整测试记录见 [验证记录](docs/VALIDATION.md)。默认标记可避免同设置重复处理；更改质量设置、使用 `--no-cache`、丢失标记或移动输出后仍可能再次有损压缩。建议保留原图并从原图使用 `-o` 输出。
