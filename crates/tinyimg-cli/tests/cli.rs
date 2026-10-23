@@ -629,3 +629,87 @@ fn explicit_avif_output_is_real_and_external_avif_input_remains_skipped() {
     assert!(again.status.success());
     assert_eq!(json(&again)["summary"]["skipped"], 1);
 }
+
+#[test]
+fn ordinary_text_omits_preset_notice_but_verbose_and_json_keep_it() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("small.png"), b"tiny").unwrap();
+    for flags in [vec![], vec!["-v"], vec!["--report", "json"], vec!["-q"]] {
+        let output = bin()
+            .arg(dir.path())
+            .arg("--dry-run")
+            .args(&flags)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stdout.contains('\r') && !stderr.contains('\r'));
+        assert!(!stdout.contains('\x1b') && !stderr.contains('\x1b'));
+        if flags.contains(&"json") {
+            let report = json(&output);
+            assert_eq!(report["presets_calibrated"], false);
+            assert!(
+                report["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| w.as_str().unwrap().contains("not visually calibrated"))
+            );
+        } else if flags.contains(&"-v") {
+            assert!(stdout.contains("not visually calibrated"));
+        } else {
+            assert!(!stdout.contains("not visually calibrated"));
+        }
+        if flags.contains(&"-q") {
+            assert!(stdout.is_empty() && stderr.is_empty());
+        }
+    }
+}
+
+#[test]
+fn concurrent_progress_counts_skips_and_errors_once_without_changing_reports() {
+    use std::sync::Mutex;
+    use tinyimg_core::{
+        Mode, ProgressEvent, RunOptions,
+        config::{Config, SettingsPatch},
+    };
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("small.png"), b"tiny").unwrap();
+    fs::write(dir.path().join("invalid.png"), vec![0; 3000]).unwrap();
+    let removed = dir.path().join("removed.png");
+    fs::write(&removed, vec![0; 3000]).unwrap();
+    let prepared = tinyimg_core::prepare(&RunOptions {
+        inputs: vec![dir.path().to_path_buf()],
+        config: Config::default(),
+        cli_settings: SettingsPatch::default(),
+        output: None,
+        backup: None,
+        mode: Mode::DryRun,
+        jobs: 3,
+        use_cache: false,
+    })
+    .unwrap();
+    fs::remove_file(removed).unwrap();
+    let events = Mutex::new(Vec::new());
+    let mut report = prepared
+        .run_with_progress(|event| {
+            if let ProgressEvent::Complete { file_index, .. } = event {
+                events.lock().unwrap().push(file_index);
+            }
+        })
+        .unwrap();
+    let mut completed = events.into_inner().unwrap();
+    completed.sort_unstable();
+    assert_eq!(completed, vec![0, 1, 2]);
+    assert_eq!(report.summary.scanned, 3);
+    assert_eq!(report.summary.errors, 1);
+    assert_eq!(report.summary.skipped, 2);
+    report
+        .warnings
+        .push("Reference scan incomplete: test failure".into());
+    let ordinary = report.text(false);
+    assert!(ordinary.contains("ERROR"));
+    assert!(ordinary.contains("Reference scan incomplete: test failure"));
+    assert!(!ordinary.contains("not visually calibrated"));
+}

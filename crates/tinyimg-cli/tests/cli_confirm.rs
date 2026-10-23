@@ -94,6 +94,8 @@ fn negative_empty_eof_and_other_answers_cancel_without_any_mutations() {
         );
         assert!(output.status.success());
         assert!(prompted(&output));
+        assert!(!output.stderr.contains(&b'\r'));
+        assert!(!output.stderr.contains(&0x1b));
         assert_eq!(json(&output)["cancelled"], true);
         assert_eq!(json(&output)["eligible_images"], 1);
         assert_eq!(tree(dir.path()), before);
@@ -261,6 +263,8 @@ fn execution_uses_the_confirmed_scan_without_adding_later_images() {
         prompt.push(byte[0]);
     }
     assert!(String::from_utf8_lossy(&prompt).contains("Found 1 eligible image(s)"));
+    assert!(!prompt.contains(&b'\r'));
+    assert!(!prompt.contains(&0x1b));
     // The prompt must precede even the first image/cache write.
     assert_eq!(fs::read(&first).unwrap(), original);
     assert!(!dir.path().join(".tinyimg-cache").exists());

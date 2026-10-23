@@ -5,6 +5,7 @@
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::Cell,
     collections::HashSet,
     io::Cursor,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -137,6 +138,34 @@ pub struct Optimization {
     pub runtime_error: Option<String>,
 }
 
+/// Work beginning inside one image optimization, without an estimated percent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageProgress {
+    /// One of `decoding`, `encoding`, `verifying`, or `final verification`.
+    pub phase: &'static str,
+    /// Number of candidate encoding attempts started so far, initially zero.
+    /// A multi-stage encoder counts as one candidate attempt.
+    pub attempt: usize,
+}
+
+struct Progress<'a> {
+    callback: &'a dyn Fn(ImageProgress),
+    attempt: Cell<usize>,
+}
+impl Progress<'_> {
+    fn report(&self, phase: &'static str) {
+        (self.callback)(ImageProgress {
+            phase,
+            attempt: self.attempt.get(),
+        });
+    }
+
+    fn encoding(&self) {
+        self.attempt.set(self.attempt.get() + 1);
+        self.report("encoding");
+    }
+}
+
 #[derive(Debug, Default)]
 struct Restrictions {
     lossless_only: Option<String>,
@@ -147,12 +176,30 @@ struct Restrictions {
 /// Optimize one complete file without writing anything. A returned candidate has
 /// been decoded and verified twice, including a final independent verification.
 pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimization, String> {
+    optimize_bytes_with_progress(input, options, &|_| {})
+}
+
+/// Optimize one complete file and report actual work as each phase starts.
+///
+/// The callback runs synchronously on the calling thread. Encoding attempts are
+/// counted across all codecs, including unsuccessful attempts. Verification is
+/// reported only when encoded bytes exist, and final verification only when a
+/// candidate has been selected. Skipped work does not emit progress events.
+pub fn optimize_bytes_with_progress(
+    input: &[u8],
+    options: &OptimizeOptions,
+    callback: &dyn Fn(ImageProgress),
+) -> Result<Optimization, String> {
     if !options.score.is_finite() || !(0.0..=100.0).contains(&options.score) {
         return Err("score must be finite and between 0 and 100".into());
     }
     if !options.min_saving.is_finite() || !(0.0..=100.0).contains(&options.min_saving) {
         return Err("min-saving must be finite and between 0 and 100 percent".into());
     }
+    let progress = Progress {
+        callback,
+        attempt: Cell::new(0),
+    };
     let detected = image::guess_format(input).map_err(|e| format!("unrecognized image: {e}"))?;
     let source_format = match detected {
         ImageFormat::Png => Format::Png,
@@ -198,6 +245,7 @@ pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimiz
         result.skip_reason = Some("strip-all would remove an unmanaged color profile/gamma and change displayed colors; original retained".into());
         return Ok(result);
     }
+    progress.report("decoding");
     let decoded = decode(input, detected)?;
     let rgba = decoded.to_rgba8();
     result.has_alpha = has_transparency(&decoded);
@@ -239,6 +287,7 @@ pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimiz
     let mut feasible = Vec::new();
     if allowed(Format::Png) {
         if source_format == Format::Png {
+            progress.encoding();
             let candidate = encode_oxipng(input, options.metadata);
             record_candidate(
                 candidate,
@@ -247,8 +296,10 @@ pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimiz
                 None,
                 &mut result,
                 &mut feasible,
+                &progress,
             );
         } else if cross_lossless_allowed {
+            progress.encoding();
             let candidate = encode_png(&rgba).and_then(|b| encode_oxipng(&b, options.metadata));
             record_candidate(
                 candidate,
@@ -257,13 +308,21 @@ pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimiz
                 None,
                 &mut result,
                 &mut feasible,
+                &progress,
             );
         }
         if lossy_allowed {
-            search_codec(Codec::PngQuant, &source, &mut result, &mut feasible);
+            search_codec(
+                Codec::PngQuant,
+                &source,
+                &mut result,
+                &mut feasible,
+                &progress,
+            );
         }
     }
     if allowed(Format::Webp) && cross_lossless_allowed {
+        progress.encoding();
         record_candidate(
             encode_codec(Codec::WebpLossless, &rgba, None),
             &source,
@@ -271,9 +330,16 @@ pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimiz
             None,
             &mut result,
             &mut feasible,
+            &progress,
         );
         if lossy_allowed {
-            search_codec(Codec::WebpLossy, &source, &mut result, &mut feasible);
+            search_codec(
+                Codec::WebpLossy,
+                &source,
+                &mut result,
+                &mut feasible,
+                &progress,
+            );
         }
     }
     if allowed(Format::Jpeg) {
@@ -282,7 +348,7 @@ pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimiz
                 .warnings
                 .push("JPEG skipped: source has non-opaque pixels".into());
         } else if lossy_allowed {
-            search_codec(Codec::Jpeg, &source, &mut result, &mut feasible);
+            search_codec(Codec::Jpeg, &source, &mut result, &mut feasible, &progress);
         }
     }
     if allowed(Format::Avif) && lossy_allowed {
@@ -291,7 +357,7 @@ pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimiz
                 "AVIF skipped: maximum {MAX_AVIF_PIXELS} pixels for bounded encoder memory"
             ));
         } else {
-            search_codec(Codec::Avif, &source, &mut result, &mut feasible);
+            search_codec(Codec::Avif, &source, &mut result, &mut feasible, &progress);
         }
     }
     result.runtime_error = all_candidates_failed(&result.candidates);
@@ -299,6 +365,7 @@ pub fn optimize_bytes(input: &[u8], options: &OptimizeOptions) -> Result<Optimiz
     if let Some(index) = selected {
         let candidate = feasible.swap_remove(index);
         // Never trust a search-stage score in place of final-byte verification.
+        progress.report("final verification");
         match verify(&source, &candidate.bytes, candidate.summary.lossless) {
             Ok(score)
                 if candidate.bytes.len() < input.len()
@@ -856,6 +923,7 @@ fn record_candidate(
     quality: Option<u8>,
     result: &mut Optimization,
     feasible: &mut Vec<Candidate>,
+    progress: &Progress<'_>,
 ) -> Option<f64> {
     let mut summary = CandidateSummary {
         encoder: codec.name().into(),
@@ -871,6 +939,7 @@ fn record_candidate(
     match encoded {
         Ok(bytes) => {
             summary.size = bytes.len();
+            progress.report("verifying");
             match verify(source, &bytes, codec.lossless()) {
                 Ok(s) => {
                     summary.score = s;
@@ -909,8 +978,10 @@ fn search_codec(
     source: &Source<'_>,
     result: &mut Optimization,
     feasible: &mut Vec<Candidate>,
+    progress: &Progress<'_>,
 ) {
     quality_search(source.target, |q| {
+        progress.encoding();
         record_candidate(
             encode_codec(codec, source.rgba, Some(q)),
             source,
@@ -918,6 +989,7 @@ fn search_codec(
             Some(q),
             result,
             feasible,
+            progress,
         )
     });
 }
@@ -1149,6 +1221,7 @@ fn select_candidate(
 mod tests {
     use super::*;
     use image::{ImageBuffer, Rgba};
+    use std::cell::RefCell;
 
     fn options(formats: Vec<Format>) -> OptimizeOptions {
         OptimizeOptions {
@@ -1199,6 +1272,151 @@ mod tests {
             writer.finish().unwrap();
         }
         bytes
+    }
+    fn uncompressed_png(rgba: &RgbaImage) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, rgba.width(), rgba.height());
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::NoCompression);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(rgba.as_raw()).unwrap();
+            writer.finish().unwrap();
+        }
+        bytes
+    }
+    #[test]
+    fn progress_reports_lossless_phases_without_changing_output() {
+        let bytes = uncompressed_png(&fixture(4, 4, true));
+        let opts = options(vec![Format::Png, Format::Webp]);
+        let baseline = optimize_bytes(&bytes, &opts).unwrap();
+        let events = RefCell::new(Vec::new());
+        let observed = optimize_bytes_with_progress(&bytes, &opts, &|event| {
+            events.borrow_mut().push(event);
+        })
+        .unwrap();
+        assert!(observed.selected.is_some());
+        // Optimization's Debug representation includes selected bytes, every
+        // summary, warnings and skip/error state, not just the chosen format.
+        assert_eq!(format!("{observed:?}"), format!("{baseline:?}"));
+        let phases: Vec<_> = events
+            .into_inner()
+            .into_iter()
+            .map(|event| (event.phase, event.attempt))
+            .collect();
+        assert_eq!(
+            phases,
+            vec![
+                ("decoding", 0),
+                ("encoding", 1),
+                ("verifying", 1),
+                ("encoding", 2),
+                ("verifying", 2),
+                ("final verification", 2),
+            ]
+        );
+    }
+    #[test]
+    fn progress_counts_each_search_probe_in_order() {
+        let bytes = uncompressed_png(&fixture(32, 32, false));
+        let opts = options(vec![Format::Png, Format::Webp, Format::Jpeg]);
+        let events = RefCell::new(Vec::new());
+        let result = optimize_bytes_with_progress(&bytes, &opts, &|event| {
+            events.borrow_mut().push(event);
+        })
+        .unwrap();
+        assert!(result.selected.is_some());
+        let events = events.into_inner();
+        assert_eq!(events[0].phase, "decoding");
+        assert_eq!(events[0].attempt, 0);
+        let encoding: Vec<_> = events
+            .iter()
+            .filter(|event| event.phase == "encoding")
+            .map(|event| event.attempt)
+            .collect();
+        assert_eq!(encoding, (1..=result.candidates.len()).collect::<Vec<_>>());
+        assert!(encoding.len() > 3, "bounded quality searches must run");
+        assert!(encoding.len() <= 2 + 3 * SEARCH_ATTEMPTS);
+        let mut attempts = 0;
+        let mut previous_phase = "decoding";
+        for event in &events[1..] {
+            match event.phase {
+                "encoding" => attempts += 1,
+                "verifying" => assert_eq!(previous_phase, "encoding"),
+                "final verification" => assert_eq!(event, events.last().unwrap()),
+                phase => panic!("unexpected progress phase: {phase}"),
+            }
+            assert_eq!(event.attempt, attempts);
+            previous_phase = event.phase;
+        }
+        assert_eq!(events.last().unwrap().phase, "final verification");
+    }
+    #[test]
+    fn progress_does_not_report_skipped_work() {
+        let bytes = encode_png(&fixture(4, 4, true)).unwrap();
+        let events = RefCell::new(Vec::new());
+        let result = optimize_bytes_with_progress(&bytes, &options(vec![]), &|event| {
+            events.borrow_mut().push(event);
+        })
+        .unwrap();
+        assert!(result.selected.is_none());
+        assert_eq!(
+            *events.borrow(),
+            vec![ImageProgress {
+                phase: "decoding",
+                attempt: 0,
+            }]
+        );
+        events.borrow_mut().clear();
+        let unmanaged = png_with_chunk(&fixture(4, 4, true), *b"gAMA", &100000u32.to_be_bytes());
+        let mut opts = options(vec![Format::Png]);
+        opts.metadata = MetadataPolicy::StripAll;
+        let result = optimize_bytes_with_progress(&unmanaged, &opts, &|event| {
+            events.borrow_mut().push(event);
+        })
+        .unwrap();
+        assert!(result.skip_reason.is_some());
+        assert!(events.borrow().is_empty());
+    }
+    #[test]
+    fn progress_does_not_verify_failed_encoding() {
+        let rgba = fixture(4, 4, true);
+        let decoded = DynamicImage::ImageRgba8(rgba.clone());
+        let source = Source {
+            decoded: &decoded,
+            rgba: &rgba,
+            has_alpha: true,
+            tiny: true,
+            target: 80.0,
+        };
+        let mut result = optimize_bytes(&encode_png(&rgba).unwrap(), &options(vec![])).unwrap();
+        let events = RefCell::new(Vec::new());
+        let callback = |event| events.borrow_mut().push(event);
+        let progress = Progress {
+            callback: &callback,
+            attempt: Cell::new(0),
+        };
+        progress.encoding();
+        let mut feasible = Vec::new();
+        record_candidate(
+            Err("test encoder failed".into()),
+            &source,
+            Codec::WebpLossless,
+            None,
+            &mut result,
+            &mut feasible,
+            &progress,
+        );
+        assert!(feasible.is_empty());
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(
+            events.into_inner(),
+            vec![ImageProgress {
+                phase: "encoding",
+                attempt: 1,
+            }]
+        );
     }
     #[test]
     fn identical_ssimulacra2_is_100() {

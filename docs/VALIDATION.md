@@ -3,7 +3,7 @@
 Verified on x86_64 Linux (Debian 13), Rust 1.99.1, default locked dependency features:
 
 - `make check`: rustfmt and workspace/all-target Clippy with warnings denied passed.
-- `make test`: 91 core unit tests and 32 CLI integration tests passed (123 total).
+- `make test`: 95 core unit tests, 4 CLI progress unit tests, and 34 CLI integration tests passed (133 total).
 - `cargo deny check licenses sources`: passed with cargo-deny 0.20.2.
 - `cargo about generate --locked --workspace --fail --format json -o THIRD-PARTY-LICENSES.json`: passed with cargo-about 0.9.2 (`--features cli` required when installing it). Machine-local path metadata was normalized with `scripts/sanitize_license_inventory.py`; full license texts remain unchanged.
 - `make release`: Linux release executable built successfully.
@@ -12,6 +12,8 @@ Verified on x86_64 Linux (Debian 13), Rust 1.99.1, default locked dependency fea
 The included Linux executable dynamically links glibc, libm and libgcc_s; this build references GLIBC_2.39. It is not a universal Linux/static binary. Build from source on older distributions.
 
 The suite exercises real PNG/WebP/JPEG/AVIF roundtrips, final-byte measured SSIMULACRA2 and exact lossless identity, transparency, metadata restrictions, quality search, conversion savings, Android manifests/density rules, no-write modes, output preservation, rollback/no-clobber, bounded source reads, Unicode/spaces, Unix non-UTF-8 JSON paths, and root aliases versus descendant symlinks.
+
+Progress tests cover real candidate phase/attempt order and output equivalence, bounded active rows, hidden-row promotion, out-of-order completion counts, one completion per skip/error, terminal-control escaping, and TTY/JSON/quiet gating. Actual Linux pseudo-terminal smoke checks additionally exercise four concurrent images, a single image, a narrow 30x7 terminal, cancellation before any animation, JSON/quiet output, and independent stdout/stderr redirection. Completed result records are emitted once; active rows are cleared before the final summary.
 
 The directory-confirmation tests cover y/yes, n, empty input, EOF, mixed directory/file inputs, zero eligible images, size/filter protections, quiet mode, clean JSON stdout, output and read-only bypasses, and adding a new image while waiting for confirmation (the new image is not processed). The target/release regression invokes relative `编组 (2).png` and `test.png` from inside that directory; both are processed, while nested default-excluded trees remain pruned.
 

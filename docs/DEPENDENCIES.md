@@ -4,6 +4,8 @@
 
 | 组件 | 版本 | Cargo 声明的许可 | 用途 |
 | --- | --- | --- | --- |
+| indicatif | 0.18.6 | MIT | 多图片终端进度与动画，非终端禁用 |
+| console | 0.16.6 | MIT | 跨平台终端尺寸、Unicode 宽度与安全截断 |
 | oxipng | 10.2.1 | MIT | PNG 无损优化 |
 | imagequant | 4.4.1 | GPL-3.0-or-later | PNG 调色板量化 |
 | webp | 0.3.1 | MIT OR Apache-2.0 | WebP Rust 接口 |

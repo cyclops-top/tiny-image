@@ -184,6 +184,10 @@ tinyimg res -o optimized/ --report json --report-file tinyimg-report.json
 | 2 | 参数或配置错误 |
 | 3 | `--check` 找到可执行的优化项 |
 
+交互终端为正在处理的图片显示独立动画行：文件名、实际解码/编码尝试/质量验证/写入阶段及耗时；单张图片同样可见。编码器内部没有精确百分比，因此使用持续转动的指示符，不虚构单图百分比。完成的行从活动区移除并留下结果记录，底部显示已处理/总数、活动数及总耗时。默认最多同时处理 4 张，活动区随终端高度最多显示 8 行，额外任务计入活动数且仍并发执行。跳过和失败也计入已处理。进度仅写入交互终端 stderr；JSON、`-q`、不支持的/过小的终端或重定向 stdout/stderr 时禁用，目录确认前不会启动。
+
+预设未校准的说明保留在帮助、JSON 和 `-v` 中，不再每次打印到普通文本报告；实际错误和操作相关警告仍然显示。
+
 文本报告列出逐图结果、跳过原因和引用警告；`analyze` 或 `-v` 显示候选细节。JSON 包括 `files`、`summary`、`renames`、`reference_warnings`、`presets_calibrated: false` 和 `cache_enabled`、`summary.cache_hits`。`-q` 抑制普通文本输出，JSON 仍输出。
 
 引用检查只读取支持的 UTF-8 文本文件，单文件上限 2 MiB；不修改源码，不是静态分析器。优化后的引用检查最多向上查找 8 层，在最近的 AndroidManifest.xml 所在目录或 Git 边界停止，以覆盖资源目录旁的源码和 assets；找不到边界则只查输入目录。`tinyimg refs .` 可显式检查更大的项目范围。动态路径、外部文件和二进制引用仍可能遗漏。

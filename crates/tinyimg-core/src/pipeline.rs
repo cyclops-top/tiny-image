@@ -13,6 +13,21 @@ use std::{
     time::Instant,
 };
 
+#[derive(Debug, Clone, Copy)]
+pub enum ProgressEvent<'a> {
+    Phase {
+        file_index: usize,
+        source: &'a Path,
+        progress: imaging::ImageProgress,
+    },
+    Complete {
+        file_index: usize,
+        report: &'a FileReport,
+    },
+}
+
+const PRESET_NOTICE: &str = "Preset scores (high=88, balanced=80, small=70) are experimental, not visually calibrated. Review important UI/text assets before replacement.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Write,
@@ -84,61 +99,16 @@ impl Report {
     pub fn text(&self, verbose: bool) -> String {
         let mut text = String::new();
         for file in &self.files {
-            if file.status == "skipped" {
-                text.push_str(&format!(
-                    "SKIP {}: {}\n",
-                    file.source.display(),
-                    file.reason.as_deref().unwrap_or("no improvement")
-                ));
-            } else if file.status == "error" {
-                text.push_str(&format!(
-                    "ERROR {}: {}\n",
-                    file.source.display(),
-                    file.reason.as_deref().unwrap_or("unknown error")
-                ));
-            } else {
-                text.push_str(&format!(
-                    "{} {} -> {}  {} -> {} bytes (-{}), score {}\n",
-                    file.status.to_uppercase(),
-                    file.source.display(),
-                    file.output.as_deref().unwrap_or(&file.source).display(),
-                    file.original_bytes,
-                    file.optimized_bytes.unwrap_or(file.original_bytes),
-                    file.saving_bytes,
-                    file.score
-                        .map(|n| format!(
-                            "{n:.2}{}",
-                            if file.score_basis.as_deref() == Some("exact decoded-pixel identity") {
-                                " (pixel-identical)"
-                            } else {
-                                ""
-                            }
-                        ))
-                        .unwrap_or_else(|| "lossless (pixel verified)".into())
-                ));
-            }
-            if verbose || self.mode == "analyze" {
-                for c in &file.candidates {
-                    text.push_str(&format!(
-                        "  {} {:?}: {} bytes, score {}, accepted={}{}\n",
-                        c.encoder,
-                        c.quality,
-                        c.size,
-                        c.score
-                            .map(|n| format!("{n:.2}"))
-                            .unwrap_or_else(|| "lossless/N/A".into()),
-                        c.accepted,
-                        c.note
-                            .as_ref()
-                            .map(|s| format!(", {s}"))
-                            .unwrap_or_default()
-                    ));
-                }
-            }
-            for warning in &file.warnings {
-                text.push_str(&format!("  warning: {warning}\n"));
-            }
+            text.push_str(&file.text(verbose, self.mode == "analyze"));
         }
+        text.push_str(&self.summary_text(verbose));
+        text
+    }
+
+    /// Summary for an interactive UI which already printed every file result.
+    pub fn summary_text(&self, verbose: bool) -> String {
+        let mut text = String::new();
+
         text.push_str(&format!(
             "\n{} files; {} optimized, {} skipped, {} errors; {} bytes saved ({:.1}%); {} ms\n",
             self.summary.scanned,
@@ -162,7 +132,71 @@ impl Report {
             ));
         }
         for warning in &self.warnings {
+            if !verbose && warning == PRESET_NOTICE {
+                continue;
+            }
             text.push_str(&format!("warning: {warning}\n"));
+        }
+        text
+    }
+}
+impl FileReport {
+    pub fn text(&self, verbose: bool, analyze: bool) -> String {
+        let file = self;
+        let mut text = String::new();
+        if file.status == "skipped" {
+            text.push_str(&format!(
+                "SKIP {}: {}\n",
+                file.source.display(),
+                file.reason.as_deref().unwrap_or("no improvement")
+            ));
+        } else if file.status == "error" {
+            text.push_str(&format!(
+                "ERROR {}: {}\n",
+                file.source.display(),
+                file.reason.as_deref().unwrap_or("unknown error")
+            ));
+        } else {
+            text.push_str(&format!(
+                "{} {} -> {}  {} -> {} bytes (-{}), score {}\n",
+                file.status.to_uppercase(),
+                file.source.display(),
+                file.output.as_deref().unwrap_or(&file.source).display(),
+                file.original_bytes,
+                file.optimized_bytes.unwrap_or(file.original_bytes),
+                file.saving_bytes,
+                file.score
+                    .map(|n| format!(
+                        "{n:.2}{}",
+                        if file.score_basis.as_deref() == Some("exact decoded-pixel identity") {
+                            " (pixel-identical)"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .unwrap_or_else(|| "lossless (pixel verified)".into())
+            ));
+        }
+        if verbose || analyze {
+            for c in &file.candidates {
+                text.push_str(&format!(
+                    "  {} {:?}: {} bytes, score {}, accepted={}{}\n",
+                    c.encoder,
+                    c.quality,
+                    c.size,
+                    c.score
+                        .map(|n| format!("{n:.2}"))
+                        .unwrap_or_else(|| "lossless/N/A".into()),
+                    c.accepted,
+                    c.note
+                        .as_ref()
+                        .map(|s| format!(", {s}"))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+        for warning in &file.warnings {
+            text.push_str(&format!("  warning: {warning}\n"));
         }
         text
     }
@@ -227,7 +261,16 @@ impl PreparedRun {
     }
 
     pub fn run(self) -> Result<Report> {
-        run_prepared(self)
+        self.run_with_progress(|_| {})
+    }
+
+    /// Report image phases and one completion per scan item (including skips/errors).
+    /// Called concurrently by image workers; callbacks should be brief and must not panic.
+    pub fn run_with_progress(
+        self,
+        on_progress: impl Fn(ProgressEvent<'_>) + Sync,
+    ) -> Result<Report> {
+        run_prepared(self, &on_progress)
     }
 }
 
@@ -340,7 +383,10 @@ pub fn prepare(options: &RunOptions) -> Result<PreparedRun> {
     })
 }
 
-fn run_prepared(prepared: PreparedRun) -> Result<Report> {
+fn run_prepared(
+    prepared: PreparedRun,
+    on_progress: &(impl Fn(ProgressEvent<'_>) + Sync),
+) -> Result<Report> {
     let start = Instant::now();
     let PreparedRun {
         options,
@@ -356,15 +402,17 @@ fn run_prepared(prepared: PreparedRun) -> Result<Report> {
         .build()
         .context("create image worker pool")?;
     let files = pool.install(|| {
-        scan.items.par_iter().map(|item| {
+        scan.items.par_iter().enumerate().map(|(file_index, item)| {
             let started = Instant::now();
             let mut report = base_report(item);
             if let Some(reason) = &item.skip_reason {
                 report.reason = Some(reason.clone());
-                return report;
+                return (file_index, report);
             }
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                process(item, options, &selected_roots, &mut report)
+                process(item, options, &selected_roots, &mut report, &|progress| {
+                    on_progress(ProgressEvent::Phase { file_index, source: &item.source, progress });
+                })
             }));
             match outcome {
                 Ok(Ok(())) => {},
@@ -380,6 +428,9 @@ fn run_prepared(prepared: PreparedRun) -> Result<Report> {
                 },
             }
             report.elapsed_ms = started.elapsed().as_millis() as u64;
+            (file_index, report)
+        }).map(|(file_index, report)| {
+            on_progress(ProgressEvent::Complete { file_index, report: &report });
             report
         }).collect::<Vec<_>>()
     });
@@ -396,7 +447,7 @@ fn run_prepared(prepared: PreparedRun) -> Result<Report> {
                 })
         })
         .collect();
-    let mut warnings=vec!["Preset scores (high=88, balanced=80, small=70) are experimental, not visually calibrated. Review important UI/text assets before replacement.".into()];
+    let mut warnings = vec![PRESET_NOTICE.into()];
     let reference_warnings =
         match scanner::find_rename_references(&reference_roots, &renames, &excluded_dirs) {
             Ok(r) => r,
@@ -444,7 +495,12 @@ fn process(
     options: &RunOptions,
     selected_roots: &[PathBuf],
     report: &mut FileReport,
+    on_progress: &dyn Fn(imaging::ImageProgress),
 ) -> Result<()> {
+    on_progress(imaging::ImageProgress {
+        phase: "reading",
+        attempt: 0,
+    });
     let snapshot = SourceSnapshot::capture(&item.source)?;
     report.original_bytes = snapshot.bytes().len() as u64;
     let settings = options
@@ -488,7 +544,11 @@ fn process(
             "assets path: format conversion disabled to protect filename-based access".into(),
         );
     }
-    let optimized = match imaging::optimize_bytes(snapshot.bytes(), &image_options) {
+    let optimized = match imaging::optimize_bytes_with_progress(
+        snapshot.bytes(),
+        &image_options,
+        on_progress,
+    ) {
         Ok(x) => x,
         Err(e) => {
             report.reason = Some(format!("image skipped: {e}"));
@@ -550,6 +610,10 @@ fn process(
         options.output.is_some(),
     )?;
     if options.mode == Mode::Write {
+        on_progress(imaging::ImageProgress {
+            phase: "saving",
+            attempt: report.candidates.len(),
+        });
         writer::write_candidate(
             &item.source,
             &target,

@@ -1,3 +1,5 @@
+mod progress;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::{
     fs::{self, OpenOptions},
@@ -244,10 +246,23 @@ fn optimize(mut args: OptimizeArgs, analyze: bool) -> CliResult {
             return Ok(0);
         }
     }
-    let report = prepared.run().map_err(|e| (1, e))?;
+    let progress = progress::Progress::new(
+        prepared.eligible_images() + prepared.known_skipped(),
+        args.quiet,
+        matches!(args.report, ReportFormat::Json),
+        args.verbose,
+        analyze,
+    );
+    let result = prepared.run_with_progress(|event| progress.update(event));
+    let streamed = progress.streamed_results();
+    drop(progress); // Finish the terminal line before reports or errors.
+    let report = result.map_err(|e| (1, e))?;
     let rendered = match args.report {
         ReportFormat::Json => {
             serde_json::to_string_pretty(&report).map_err(|e| (1, e.into()))? + "\n"
+        }
+        ReportFormat::Text if streamed && args.report_file.is_none() => {
+            report.summary_text(args.verbose)
         }
         ReportFormat::Text => report.text(args.verbose),
     };
