@@ -2,7 +2,7 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::{
     collections::BTreeMap,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -84,6 +84,7 @@ struct Display {
     verbose: bool,
     analyze: bool,
     output_failed: bool,
+    record_writer: Box<dyn Write + Send>,
 }
 
 impl Display {
@@ -114,6 +115,7 @@ impl Display {
             verbose,
             analyze,
             output_failed: false,
+            record_writer: Box::new(io::stderr()),
         }
     }
 
@@ -158,10 +160,15 @@ impl Display {
                 } else {
                     completion_record(file_index, report)
                 };
-                for line in record.trim_end().lines() {
-                    if self.multi.println(sanitize(line)).is_err() {
-                        self.output_failed = true;
-                    }
+                // indicatif::println pads to terminal width and relies on soft wraps.
+                // Real newlines keep copied/pasted completion records separate.
+                let writer = &mut self.record_writer;
+                if self
+                    .multi
+                    .suspend(|| write_records(writer, &record))
+                    .is_err()
+                {
+                    self.output_failed = true;
                 }
                 self.summary.set_position(self.done as u64);
             }
@@ -229,6 +236,13 @@ impl Display {
         self.summary.finish_and_clear();
         let _ = self.multi.clear();
     }
+}
+
+fn write_records(writer: &mut dyn Write, record: &str) -> io::Result<()> {
+    for line in record.trim_end().lines() {
+        writeln!(writer, "{}", sanitize(line))?;
+    }
+    writer.flush()
 }
 
 fn completion_record(index: usize, report: &tinyimg_core::FileReport) -> String {
@@ -356,6 +370,7 @@ mod tests {
             false,
             false,
         );
+        display.record_writer = Box::new(io::sink());
         for file_index in 0..3 {
             display.update(ProgressEvent::Phase {
                 file_index,
@@ -391,6 +406,33 @@ mod tests {
         assert_eq!(display.summary.position(), 3);
         assert_eq!(display.summary.message(), "active 0");
         display.finish();
+    }
+
+    #[test]
+    fn permanent_records_have_explicit_newlines_without_terminal_padding() {
+        let record = "SKIP #16 猪-少年.png: PNG EXIF orientation is not normalized; original retained to avoid rotation changes\nSKIP #23 猴-幼年笑.png: original retained\n";
+        let mut output = Vec::new();
+        write_records(&mut output, record).unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), record);
+    }
+
+    #[test]
+    fn record_write_failures_are_returned_for_report_fallback() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            write_records(&mut Broken, "SKIP image.png\n")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]

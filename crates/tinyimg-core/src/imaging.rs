@@ -439,16 +439,23 @@ fn inspect_container(input: &[u8], format: Format) -> Result<Restrictions, Strin
             for (name, data) in chunks {
                 match &name {
                     b"acTL" => r.skip = Some("animated PNG is not supported".into()),
-                    b"eXIf" => r.skip = Some("PNG EXIF orientation is not normalized; original retained to avoid rotation changes".into()),
+                    b"eXIf" if !png_exif_has_identity_orientation(data) => {
+                        r.skip = Some("PNG EXIF orientation is non-identity or unreadable; original retained to avoid rotation changes".into());
+                    }
                     b"iCCP" | b"cHRM" | b"cICP" | b"mDCv" | b"cLLi" => {
-                        r.unmanaged_color=true;
+                        r.unmanaged_color = true;
                         r.lossless_only=Some("PNG has color-management metadata; only lossless optimization is safe without a verified color transform".into());
-                    },
+                    }
                     b"gAMA" if !explicit_srgb || data != 45455u32.to_be_bytes() => {
-                        r.unmanaged_color=true;
+                        r.unmanaged_color = true;
                         r.lossless_only=Some("non-sRGB PNG gamma requires color management; only lossless optimization is allowed".into());
-                    },
-                    b"caBX" => r.skip = Some("signed C2PA PNG retained; optimization would invalidate provenance".into()),
+                    }
+                    b"caBX" => {
+                        r.skip = Some(
+                            "signed C2PA PNG retained; optimization would invalidate provenance"
+                                .into(),
+                        )
+                    }
                     _ => (),
                 }
             }
@@ -536,6 +543,59 @@ fn inspect_container(input: &[u8], format: Format) -> Result<Restrictions, Strin
         Format::Avif => r.skip = Some(AVIF_INPUT_REJECTION.into()),
     }
     Ok(r)
+}
+
+/// PNG eXIf contains a TIFF header (not the JPEG `Exif\0\0` prefix).
+/// Only IFD0 describes the main image; thumbnail/sub-IFD orientations do not.
+/// This is intentionally not a general EXIF decoder: require a complete IFD0
+/// and an unambiguous SHORT[1] orientation of 1, or no orientation tag at all.
+/// Unreadable metadata must not be silently stripped from potentially rotated pixels.
+fn png_exif_has_identity_orientation(data: &[u8]) -> bool {
+    fn inspect(data: &[u8]) -> Option<bool> {
+        let little = match data.get(..2)? {
+            b"II" => true,
+            b"MM" => false,
+            _ => return None,
+        };
+        let short = |offset: usize| -> Option<u16> {
+            let bytes = data.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
+            Some(if little {
+                u16::from_le_bytes(bytes)
+            } else {
+                u16::from_be_bytes(bytes)
+            })
+        };
+        let long = |offset: usize| -> Option<u32> {
+            let bytes = data.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+            Some(if little {
+                u32::from_le_bytes(bytes)
+            } else {
+                u32::from_be_bytes(bytes)
+            })
+        };
+        if short(2)? != 42 {
+            return None;
+        }
+        let ifd = usize::try_from(long(4)?).ok()?;
+        if ifd < 8 {
+            return None;
+        }
+        let count = usize::from(short(ifd)?);
+        let start = ifd.checked_add(2)?;
+        let end = start.checked_add(count.checked_mul(12)?)?;
+        data.get(start..end.checked_add(4)?)?; // Include the next-IFD pointer.
+        let mut orientation = None;
+        for entry in (start..end).step_by(12) {
+            if short(entry)? == 0x0112 {
+                if orientation.is_some() || short(entry + 2)? != 3 || long(entry + 4)? != 1 {
+                    return None;
+                }
+                orientation = Some(short(entry + 8)?);
+            }
+        }
+        Some(orientation.is_none_or(|value| value == 1))
+    }
+    inspect(data) == Some(true)
 }
 
 type PngChunk<'a> = ([u8; 4], &'a [u8]);
@@ -1652,6 +1712,180 @@ mod tests {
                 .contains("flattened")
         );
     }
+    fn exif_orientation(little: bool, orientation: Option<u16>) -> Vec<u8> {
+        let short = |v: u16| {
+            if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        };
+        let long = |v: u32| {
+            if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        };
+        let mut data = if little {
+            b"II".to_vec()
+        } else {
+            b"MM".to_vec()
+        };
+        data.extend(short(42));
+        data.extend(long(8));
+        data.extend(short(u16::from(orientation.is_some())));
+        if let Some(value) = orientation {
+            data.extend(short(0x0112));
+            data.extend(short(3));
+            data.extend(long(1));
+            data.extend(short(value));
+            data.extend([0, 0]);
+        }
+        data.extend(long(0));
+        data
+    }
+
+    #[test]
+    fn png_exif_normal_or_absent_orientation_allows_optimization() {
+        for little in [false, true] {
+            for orientation in [None, Some(1)] {
+                let exif = exif_orientation(little, orientation);
+                let bytes = png_with_chunk(&fixture(4, 4, true), *b"eXIf", &exif);
+                for metadata in [
+                    MetadataPolicy::Default,
+                    MetadataPolicy::StripAll,
+                    MetadataPolicy::Keep,
+                ] {
+                    let mut opts = options(vec![Format::Png, Format::Webp]);
+                    opts.metadata = metadata;
+                    let result = optimize_bytes(&bytes, &opts).unwrap();
+                    assert!(
+                        !result.candidates.is_empty(),
+                        "{little} {orientation:?} {metadata:?}"
+                    );
+                    let encoded = encode_oxipng(&bytes, metadata).unwrap();
+                    assert!(visually_exact(
+                        &image::load_from_memory(&bytes).unwrap(),
+                        &image::load_from_memory(&encoded).unwrap()
+                    ));
+                    let chunks = png_chunks(&encoded).unwrap();
+                    if metadata == MetadataPolicy::Keep {
+                        assert!(
+                            chunks
+                                .iter()
+                                .any(|(name, data)| name == b"eXIf" && *data == exif)
+                        );
+                        assert_eq!(result.candidates.len(), 1);
+                    } else {
+                        assert!(!chunks.iter().any(|(name, _)| name == b"eXIf"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn png_exif_rotated_mirrored_and_invalid_orientations_are_retained() {
+        for little in [false, true] {
+            for orientation in [0, 2, 3, 4, 5, 6, 7, 8, 9, u16::MAX] {
+                let bytes = png_with_chunk(
+                    &fixture(4, 4, true),
+                    *b"eXIf",
+                    &exif_orientation(little, Some(orientation)),
+                );
+                for metadata in [
+                    MetadataPolicy::Default,
+                    MetadataPolicy::StripAll,
+                    MetadataPolicy::Keep,
+                ] {
+                    let mut opts = options(vec![Format::Png, Format::Webp]);
+                    opts.metadata = metadata;
+                    let result = optimize_bytes(&bytes, &opts).unwrap();
+                    assert!(result.selected.is_none());
+                    assert!(result.candidates.is_empty());
+                    assert!(result.skip_reason.unwrap().contains("orientation"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn png_exif_reads_ifd0_at_its_declared_offset_only() {
+        for little in [false, true] {
+            let long = |v: u32| {
+                if little {
+                    v.to_le_bytes()
+                } else {
+                    v.to_be_bytes()
+                }
+            };
+            let short = |v: u16| {
+                if little {
+                    v.to_le_bytes()
+                } else {
+                    v.to_be_bytes()
+                }
+            };
+            let normal = exif_orientation(little, Some(1));
+            let mut padded = normal[..8].to_vec();
+            padded.extend([0; 8]);
+            padded.extend(&normal[8..]);
+            padded[4..8].copy_from_slice(&long(16));
+            assert!(png_exif_has_identity_orientation(&padded));
+            // A valid unrelated tag is not mistaken for orientation.
+            let mut unrelated = normal.clone();
+            unrelated[10..12].copy_from_slice(&short(0x0128)); // ResolutionUnit
+            unrelated[18..20].copy_from_slice(&short(2));
+            assert!(png_exif_has_identity_orientation(&unrelated));
+            // IFD1 describes a thumbnail, not the primary PNG pixels.
+            let mut thumbnail = normal.clone();
+            thumbnail[22..26].copy_from_slice(&long(26));
+            thumbnail.extend(&exif_orientation(little, Some(6))[8..]);
+            assert!(png_exif_has_identity_orientation(&thumbnail));
+            for offset in [0, 1, 7, u32::MAX] {
+                let mut invalid = normal.clone();
+                invalid[4..8].copy_from_slice(&long(offset));
+                assert!(!png_exif_has_identity_orientation(&invalid));
+            }
+        }
+    }
+
+    #[test]
+    fn png_exif_unreadable_orientation_fails_closed() {
+        for little in [false, true] {
+            let normal = exif_orientation(little, Some(1));
+            // Every incomplete header/directory, including its trailing pointer.
+            for end in 0..normal.len() {
+                assert!(!png_exif_has_identity_orientation(&normal[..end]));
+            }
+            let mut malformed = Vec::new();
+            for range in [0..2, 2..4, 4..8, 8..10, 12..14, 14..18] {
+                let mut data = normal.clone();
+                data[range].fill(0xff);
+                malformed.push(data);
+            }
+            let mut jpeg_prefix = b"Exif\0\0".to_vec();
+            jpeg_prefix.extend(&normal);
+            malformed.push(jpeg_prefix);
+            let mut duplicate = normal[..22].to_vec();
+            duplicate.extend_from_slice(&normal[10..]);
+            duplicate[8..10].copy_from_slice(&if little {
+                2u16.to_le_bytes()
+            } else {
+                2u16.to_be_bytes()
+            });
+            malformed.push(duplicate);
+            for data in malformed {
+                let bytes = png_with_chunk(&fixture(4, 4, true), *b"eXIf", &data);
+                let result = optimize_bytes(&bytes, &OptimizeOptions::default()).unwrap();
+                assert!(result.selected.is_none());
+                assert!(result.candidates.is_empty());
+                assert!(result.skip_reason.unwrap().contains("unreadable"));
+            }
+        }
+    }
+
     #[test]
     fn exif_jpeg_is_retained_without_orientation_loss() {
         let base = encode_codec(Codec::Jpeg, &fixture(16, 16, false), Some(90)).unwrap();
