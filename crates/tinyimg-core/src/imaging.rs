@@ -5,7 +5,7 @@
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::Cell,
+    cell::{Cell, OnceCell},
     collections::HashSet,
     io::Cursor,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -17,6 +17,9 @@ const MAX_DIMENSION: u32 = 8000;
 const MAX_PIXELS: u64 = 16_000_000;
 const MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 const SEARCH_ATTEMPTS: usize = 8;
+// Keep cached reference composites below 24 MB per image worker (RGBA inputs
+// require black and white planes). Larger images use the uncached metric path.
+const MAX_METRIC_CACHE_PIXELS: u64 = 1_000_000;
 // rav1e keeps several full image planes. Bound both its workload and concurrency,
 // independently of the caller's image-level worker pool.
 const MAX_AVIF_PIXELS: u64 = 4_000_000;
@@ -283,6 +286,7 @@ pub fn optimize_bytes_with_progress(
         has_alpha: result.has_alpha,
         tiny,
         target: options.score,
+        metric: OnceCell::new(),
     };
     let mut feasible = Vec::new();
     if allowed(Format::Png) {
@@ -697,6 +701,7 @@ struct Source<'a> {
     has_alpha: bool,
     tiny: bool,
     target: f64,
+    metric: OnceCell<PreparedMetric>,
 }
 
 fn encode_png(rgba: &RgbaImage) -> Result<Vec<u8>, String> {
@@ -801,7 +806,9 @@ fn encode_codec(codec: Codec, rgba: &RgbaImage, quality: Option<u8>) -> Result<V
                     .map_err(|e| e.to_string())?;
                 writer.finish().map_err(|e| e.to_string())?;
             }
-            encode_oxipng(&bytes, MetadataPolicy::Default)
+            // Search-stage rejection does not need lossless recompression.
+            // Accepted candidates are recompressed in record_candidate.
+            Ok(bytes)
         }
         Codec::WebpLossless | Codec::WebpLossy => {
             let encoder = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height());
@@ -997,15 +1004,32 @@ fn record_candidate(
     };
     let mut score = None;
     match encoded {
-        Ok(bytes) => {
+        Ok(mut bytes) => {
             summary.size = bytes.len();
             progress.report("verifying");
-            match verify(source, &bytes, codec.lossless()) {
+            match verify_candidate(source, &bytes, codec.lossless(), true) {
                 Ok(s) => {
                     summary.score = s;
                     summary.accepted = s.is_none_or(|score| score >= source.target);
                     score = Some(s.unwrap_or(100.0));
                     if summary.accepted {
+                        if matches!(codec, Codec::PngQuant) {
+                            match encode_oxipng(&bytes, MetadataPolicy::Default) {
+                                Ok(optimized) => {
+                                    bytes = optimized;
+                                    summary.size = bytes.len();
+                                }
+                                Err(error) => {
+                                    summary.accepted = false;
+                                    // A measured raw image does not turn a
+                                    // recompression failure into a quality miss.
+                                    summary.score = None;
+                                    summary.note = Some(error);
+                                    result.candidates.push(summary);
+                                    return score;
+                                }
+                            }
+                        }
                         if codec.lossless() {
                             summary.note = Some(if source.tiny {
                                 "exact decoded-pixel proof; metric unavailable below 8x8"
@@ -1019,9 +1043,14 @@ fn record_candidate(
                         });
                     } else {
                         summary.note = Some(format!(
-                            "score {:.4} is below target {:.4}",
+                            "score {:.4} is below target {:.4}{}",
                             s.unwrap(),
-                            source.target
+                            source.target,
+                            if matches!(codec, Codec::PngQuant) {
+                                "; size is before skipped lossless recompression"
+                            } else {
+                                ""
+                            }
                         ));
                     }
                 }
@@ -1040,7 +1069,7 @@ fn search_codec(
     feasible: &mut Vec<Candidate>,
     progress: &Progress<'_>,
 ) {
-    quality_search(source.target, |q| {
+    quality_search(source.target, SearchPolicy::for_codec(codec), |q| {
         progress.encoding();
         record_candidate(
             encode_codec(codec, source.rgba, Some(q)),
@@ -1070,65 +1099,130 @@ fn all_candidates_failed(candidates: &[CandidateSummary]) -> Option<String> {
     ))
 }
 
-/// Bounded secant search with bisection fallback. Every evaluated candidate is
-/// retained by the caller, including non-monotonic feasible points. This is a
-/// finite search, not a claim of a globally optimal codec quality parameter.
-fn quality_search(target: f64, mut evaluate: impl FnMut(u8) -> Option<f64>) -> Vec<u8> {
+/// Codec quality scales differ. These are starting guesses, never quality
+/// guarantees or hard lower bounds; every candidate is decoded and measured.
+#[derive(Clone, Copy)]
+struct SearchPolicy {
+    start: u8,
+    step: u8,
+    attempts: usize,
+}
+impl SearchPolicy {
+    fn for_codec(codec: Codec) -> Self {
+        let (start, step, attempts) = match codec {
+            Codec::PngQuant => (90, 15, SEARCH_ATTEMPTS),
+            Codec::WebpLossy => (80, 20, SEARCH_ATTEMPTS),
+            Codec::Jpeg => (85, 15, SEARCH_ATTEMPTS),
+            Codec::Avif => (70, 20, 6),
+            Codec::PngLossless | Codec::WebpLossless => (100, 20, 1),
+        };
+        Self {
+            start,
+            step,
+            attempts,
+        }
+    }
+}
+
+/// Finite adaptive search, not a claim of global optimality or monotonicity.
+/// Start near a useful operating point, establish a measured bracket, and try
+/// interpolation after every observation. Bisect only when interpolation cannot
+/// make progress. The caller retains *all* measured feasible candidates.
+fn quality_search(
+    target: f64,
+    policy: SearchPolicy,
+    mut evaluate: impl FnMut(u8) -> Option<f64>,
+) -> Vec<u8> {
     let mut tested = Vec::new();
     let mut observations: Vec<(u8, f64)> = Vec::new();
-    for _ in 0..SEARCH_ATTEMPTS {
-        let q = if tested.is_empty() {
-            1
-        } else if tested.len() == 1 {
-            100
-        } else {
-            let pass = observations
-                .iter()
-                .filter(|(_, s)| *s >= target)
-                .min_by_key(|(q, _)| *q)
-                .copied();
-            let fail = observations
-                .iter()
-                .filter(|(q, s)| *s < target && pass.is_none_or(|(p, _)| *q < p))
-                .max_by_key(|(q, _)| *q)
-                .copied();
-            match (fail, pass) {
-                (_, Some((1, _))) => break,
-                (Some((lo, sl)), Some((hi, sh))) if hi > lo + 1 => {
-                    let mid = lo + (hi - lo) / 2;
-                    let secant = if sh > sl {
-                        (f64::from(lo) + (target - sl) * f64::from(hi - lo) / (sh - sl)).round()
-                            as u8
-                    } else {
-                        mid
-                    };
-                    // Alternate bisection to bound progress under flat/noisy scores.
-                    if tested.len() % 2 == 1 || secant <= lo || secant >= hi {
-                        mid
-                    } else {
-                        secant
-                    }
-                }
-                (Some(_), Some(_)) => break,
-                _ => {
-                    // Missing bracket, failed encodes or high-quality non-monotonicity:
-                    // probe the largest untested interval rather than discard it.
-                    let mut sorted = tested.clone();
-                    sorted.sort_unstable();
-                    let Some(pair) = sorted
-                        .windows(2)
-                        .filter(|p| p[1] > p[0] + 1)
-                        .max_by_key(|p| p[1] - p[0])
-                    else {
-                        break;
-                    };
-                    pair[0] + (pair[1] - pair[0]) / 2
-                }
+    let mut previous_width = 100u8;
+    let mut stalled = 0;
+    for _ in 0..policy.attempts {
+        let pass = observations
+            .iter()
+            .filter(|(_, s)| *s >= target)
+            .min_by_key(|(q, _)| *q)
+            .copied();
+        let fail = observations
+            .iter()
+            .filter(|(q, s)| *s < target && pass.is_none_or(|(p, _)| *q < p))
+            .max_by_key(|(q, _)| *q)
+            .copied();
+        let interpolate = |lo: u8, sl: f64, hi: u8, sh: f64| {
+            if sh <= sl || hi <= lo {
+                return None;
             }
+            let q = f64::from(lo) + (target - sl) * f64::from(hi - lo) / (sh - sl);
+            q.is_finite().then(|| q.round().clamp(1.0, 100.0) as u8)
         };
-        if tested.contains(&q) {
+        let proposed = if tested.is_empty() {
+            Some(policy.start)
+        } else if let (Some((lo, sl)), Some((hi, sh))) = (fail, pass) {
+            if hi <= lo + 1 {
+                break;
+            }
+            let width = hi - lo;
+            if u16::from(width) * 4 >= u16::from(previous_width) * 3 {
+                stalled += 1;
+            } else {
+                stalled = 0;
+            }
+            previous_width = width;
+            let predicted =
+                interpolate(lo, sl, hi, sh).filter(|q| *q > lo && *q < hi && !tested.contains(q));
+            if stalled >= 2 || predicted.is_none() {
+                stalled = 0;
+                Some(lo + width / 2)
+            } else {
+                predicted
+            }
+        } else {
+            if pass.is_some_and(|(q, _)| q == 1) {
+                break;
+            }
+            // Extrapolate only in the direction still lacking a bracket. A bad
+            // slope or repeated boundary falls back to a bounded outward step.
+            let outward = if let Some((q, _)) = pass {
+                q.saturating_sub(policy.step.saturating_mul(1 << tested.len().min(2)))
+                    .max(1)
+            } else if let Some((q, _)) = fail {
+                q.saturating_add(policy.step.saturating_mul(1 << tested.len().min(2)))
+                    .min(100)
+            } else {
+                100
+            };
+            let prediction = if observations.len() >= 2 {
+                let mut sorted = observations.clone();
+                sorted.sort_by_key(|(q, _)| *q);
+                let pair = if pass.is_some() {
+                    &sorted[..2]
+                } else {
+                    &sorted[sorted.len() - 2..]
+                };
+                interpolate(pair[0].0, pair[0].1, pair[1].0, pair[1].1)
+                    .filter(|q| pass.is_none_or(|(hi, _)| *q < hi))
+                    .filter(|q| fail.is_none_or(|(lo, _)| *q > lo))
+                    .filter(|q| !tested.contains(q))
+            } else {
+                None
+            };
+            prediction.or_else(|| (!tested.contains(&outward)).then_some(outward))
+        };
+        // Encoder failures, flat scores, or a high-quality failure must not
+        // discard all interior points: explore the widest untested interval.
+        let q = proposed.filter(|q| !tested.contains(q)).or_else(|| {
+            let mut bounds = tested.clone();
+            bounds.extend([0, 101]);
+            bounds.sort_unstable();
+            bounds
+                .windows(2)
+                .filter(|p| p[1] > p[0] + 1)
+                .max_by_key(|p| p[1] - p[0])
+                .map(|p| p[0] + (p[1] - p[0]) / 2)
+        });
+        let Some(q) = q else {
             break;
-        }
+        };
         tested.push(q);
         if let Some(score) = evaluate(q).filter(|s| s.is_finite()) {
             observations.push((q, score));
@@ -1138,6 +1232,16 @@ fn quality_search(target: f64, mut evaluate: impl FnMut(u8) -> Option<f64>) -> V
 }
 
 fn verify(source: &Source<'_>, bytes: &[u8], lossless: bool) -> Result<Option<f64>, String> {
+    // Final verification deliberately rebuilds metric inputs from the reference
+    // and decodes the exact final bytes, independent of search-stage caches.
+    verify_candidate(source, bytes, lossless, false)
+}
+fn verify_candidate(
+    source: &Source<'_>,
+    bytes: &[u8],
+    lossless: bool,
+    reuse: bool,
+) -> Result<Option<f64>, String> {
     let format = image::guess_format(bytes).map_err(|e| e.to_string())?;
     // Only this private candidate path may decode AVIF. External inputs are
     // rejected before reaching any decoder; the lock also bounds metric RAM.
@@ -1167,7 +1271,17 @@ fn verify(source: &Source<'_>, bytes: &[u8], lossless: bool) -> Result<Option<f6
     if source.tiny {
         return Err("lossy scoring unavailable below 8x8".into());
     }
-    let score = perceptual_score(source.rgba, &rgba)?;
+    let score = if reuse
+        && u64::from(source.rgba.width()) * u64::from(source.rgba.height())
+            <= MAX_METRIC_CACHE_PIXELS
+    {
+        source
+            .metric
+            .get_or_init(|| PreparedMetric::new(source.rgba))
+            .score(&rgba)?
+    } else {
+        perceptual_score(source.rgba, &rgba)?
+    };
     Ok(Some(score))
 }
 fn visually_exact(a: &DynamicImage, b: &DynamicImage) -> bool {
@@ -1204,6 +1318,56 @@ pub fn perceptual_score(reference: &RgbaImage, candidate: &RgbaImage) -> Result<
         Ok(score.min(100.0))
     } else {
         Err("metric returned a non-finite score".into())
+    }
+}
+/// Only source linear-light composites are cached, not candidate scores or
+/// final verification. The metric consumes owned planes, so each call clones
+/// these bounded inputs rather than redoing reference sRGB conversion.
+struct PreparedMetric {
+    width: u32,
+    height: u32,
+    black: Vec<[f32; 3]>,
+    white: Option<Vec<[f32; 3]>>,
+}
+impl PreparedMetric {
+    fn new(reference: &RgbaImage) -> Self {
+        Self {
+            width: reference.width(),
+            height: reference.height(),
+            black: composite(reference, 0.0),
+            white: reference
+                .pixels()
+                .any(|p| p[3] != 255)
+                .then(|| composite(reference, 1.0)),
+        }
+    }
+    fn score(&self, candidate: &RgbaImage) -> Result<f64, String> {
+        if candidate.dimensions() != (self.width, self.height) {
+            return Err("metric dimensions differ".into());
+        }
+        let score_plane = |reference: Vec<[f32; 3]>, background| {
+            let w = self.width as usize;
+            let h = self.height as usize;
+            let a = ssimulacra2::LinearRgb::new(reference, w, h)
+                .map_err(|e| format!("metric input: {e}"))?;
+            let b = ssimulacra2::LinearRgb::new(composite(candidate, background), w, h)
+                .map_err(|e| format!("metric input: {e}"))?;
+            ssimulacra2::compute_frame_ssimulacra2(a, b).map_err(|e| e.to_string())
+        };
+        let black = score_plane(self.black.clone(), 0.0)?;
+        let score = if let Some(white) = &self.white {
+            black.min(score_plane(white.clone(), 1.0)?)
+        } else if candidate.pixels().any(|p| p[3] != 255) {
+            // An opaque reference is identical over black and white.
+            black.min(score_plane(self.black.clone(), 1.0)?)
+        } else {
+            black
+        };
+        if score.is_finite() {
+            Ok(score.min(100.0))
+        } else {
+            Err("metric returned a non-finite score".into())
+        }
     }
 }
 fn srgb_to_linear(v: u8) -> f32 {
@@ -1449,6 +1613,7 @@ mod tests {
             has_alpha: true,
             tiny: true,
             target: 80.0,
+            metric: OnceCell::new(),
         };
         let mut result = optimize_bytes(&encode_png(&rgba).unwrap(), &options(vec![])).unwrap();
         let events = RefCell::new(Vec::new());
@@ -1521,7 +1686,7 @@ mod tests {
     #[test]
     fn search_brackets_monotonic_quality_with_bounded_evaluations() {
         let mut feasible = Vec::new();
-        let visited = quality_search(80.0, |q| {
+        let visited = quality_search(80.0, SearchPolicy::for_codec(Codec::WebpLossy), |q| {
             let score = f64::from(q);
             if score >= 80.0 {
                 feasible.push(q);
@@ -1534,14 +1699,28 @@ mod tests {
     }
     #[test]
     fn search_bisects_when_scores_flat_or_encodes_fail() {
-        assert_eq!(quality_search(80.0, |_| Some(40.0)).len(), SEARCH_ATTEMPTS);
-        assert_eq!(quality_search(80.0, |_| None).len(), SEARCH_ATTEMPTS);
-        assert_eq!(quality_search(80.0, |_| Some(100.0)), vec![1, 100]);
+        assert_eq!(
+            quality_search(80.0, SearchPolicy::for_codec(Codec::WebpLossy), |_| Some(
+                40.0
+            ))
+            .len(),
+            SEARCH_ATTEMPTS
+        );
+        assert_eq!(
+            quality_search(80.0, SearchPolicy::for_codec(Codec::WebpLossy), |_| None).len(),
+            SEARCH_ATTEMPTS
+        );
+        assert_eq!(
+            quality_search(80.0, SearchPolicy::for_codec(Codec::WebpLossy), |_| Some(
+                100.0
+            )),
+            vec![80, 40, 1]
+        );
     }
     #[test]
     fn search_retains_all_nonmonotonic_feasible_probes() {
         let mut feasible = Vec::new();
-        quality_search(80.0, |q| {
+        quality_search(80.0, SearchPolicy::for_codec(Codec::WebpLossy), |q| {
             let s = if q == 100 {
                 75.0
             } else if q >= 50 {
@@ -1555,7 +1734,120 @@ mod tests {
             Some(s)
         });
         assert!(!feasible.is_empty());
-        assert!(feasible.contains(&50));
+        assert!(feasible.iter().all(|q| *q >= 50 && *q < 100));
+    }
+    #[test]
+    fn search_uses_codec_start_and_consecutive_valid_interpolation() {
+        for codec in [Codec::PngQuant, Codec::WebpLossy, Codec::Jpeg, Codec::Avif] {
+            let policy = SearchPolicy::for_codec(codec);
+            let visited = quality_search(80.0, policy, |q| Some(f64::from(q).powi(2) / 100.0));
+            assert_eq!(visited[0], policy.start);
+            assert!(visited.len() <= policy.attempts);
+            assert_eq!(visited.iter().collect::<HashSet<_>>().len(), visited.len());
+            assert!(visited.iter().all(|q| (1..=100).contains(q)));
+        }
+        let visited = quality_search(80.0, SearchPolicy::for_codec(Codec::WebpLossy), |q| {
+            Some(f64::from(q).powi(2) / 100.0)
+        });
+        assert_eq!(&visited[..4], &[80, 100, 89, 94]);
+        // A repeated rounded prediction (89) correctly falls back above; a
+        // usable prediction on the next measurement is not forced to bisect.
+        let visited = quality_search(80.0, SearchPolicy::for_codec(Codec::WebpLossy), |q| {
+            Some(10.0 * f64::from(q).sqrt())
+        });
+        assert_eq!(&visited[..4], &[80, 40, 66, 64]);
+    }
+    #[test]
+    fn search_keeps_exploring_after_high_quality_failures() {
+        let mut feasible = Vec::new();
+        let visited = quality_search(80.0, SearchPolicy::for_codec(Codec::PngQuant), |q| {
+            let score = if (40..=60).contains(&q) { 90.0 } else { 20.0 };
+            if score >= 80.0 {
+                feasible.push(q);
+            }
+            Some(score)
+        });
+        assert_eq!(&visited[..2], &[90, 100]);
+        assert!(!feasible.is_empty());
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let visited = quality_search(80.0, SearchPolicy::for_codec(Codec::Avif), |_| Some(bad));
+            assert_eq!(visited.len(), 6);
+            assert_eq!(visited.iter().collect::<HashSet<_>>().len(), visited.len());
+        }
+    }
+    #[test]
+    fn prepared_metric_matches_independent_black_and_white_scoring() {
+        for alpha in [false, true] {
+            let reference = fixture(16, 16, alpha);
+            let mut candidate = reference.clone();
+            for p in candidate.pixels_mut() {
+                p[0] = p[0].saturating_sub(9);
+            }
+            let prepared = PreparedMetric::new(&reference);
+            for introduce_alpha in [false, true] {
+                if introduce_alpha {
+                    candidate.get_pixel_mut(8, 8)[3] = 90;
+                }
+                let cached = prepared.score(&candidate).unwrap();
+                let independent = perceptual_score(&reference, &candidate).unwrap();
+                assert!((cached - independent).abs() < 1e-10);
+            }
+        }
+    }
+    #[test]
+    fn final_verification_does_not_trust_prepared_reference() {
+        let rgba = fixture(16, 16, true);
+        let decoded = DynamicImage::ImageRgba8(rgba.clone());
+        let source = Source {
+            decoded: &decoded,
+            rgba: &rgba,
+            has_alpha: true,
+            tiny: false,
+            target: 80.0,
+            metric: OnceCell::new(),
+        };
+        let mut wrong = PreparedMetric::new(&rgba);
+        wrong.black.fill([0.0; 3]);
+        assert!(source.metric.set(wrong).is_ok());
+        let bytes = encode_png(&rgba).unwrap();
+        assert!((verify(&source, &bytes, false).unwrap().unwrap() - 100.0).abs() < 1e-8);
+    }
+    #[test]
+    fn png_quant_recompresses_only_measured_feasible_candidates() {
+        let rgba = fixture(16, 16, false);
+        let input = uncompressed_png(&rgba);
+        let opts = options(vec![Format::Png]);
+        let result = optimize_bytes(&input, &opts).unwrap();
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.encoder == "imagequant+oxipng")
+        );
+        for summary in result
+            .candidates
+            .iter()
+            .filter(|c| c.encoder == "imagequant+oxipng")
+        {
+            let raw = encode_codec(Codec::PngQuant, &rgba, summary.quality).unwrap();
+            if summary.accepted {
+                let optimized = encode_oxipng(&raw, MetadataPolicy::Default).unwrap();
+                assert_eq!(summary.size, optimized.len());
+                assert!(visually_exact(
+                    &decode(&raw, ImageFormat::Png).unwrap(),
+                    &decode(&optimized, ImageFormat::Png).unwrap()
+                ));
+            } else if summary.score.is_some() {
+                assert_eq!(summary.size, raw.len());
+                assert!(
+                    summary
+                        .note
+                        .as_ref()
+                        .unwrap()
+                        .contains("skipped lossless recompression")
+                );
+            }
+        }
     }
     #[test]
     fn conversion_gate_uses_best_png_not_original() {
@@ -1600,6 +1892,7 @@ mod tests {
             has_alpha: true,
             tiny: false,
             target: 0.0,
+            metric: OnceCell::new(),
         };
         for codec in [
             Codec::PngLossless,
@@ -1701,6 +1994,7 @@ mod tests {
             has_alpha: true,
             tiny: false,
             target: 0.0,
+            metric: OnceCell::new(),
         };
         let mut flat = rgba.clone();
         for p in flat.pixels_mut() {
@@ -1945,6 +2239,7 @@ mod tests {
             has_alpha: false,
             tiny: false,
             target: opts.score,
+            metric: OnceCell::new(),
         };
         let measured = verify(&source, &selected.bytes, false).unwrap().unwrap();
         assert!((measured - selected.summary.score.unwrap()).abs() < 1e-8);
@@ -1967,6 +2262,7 @@ mod tests {
             has_alpha: true,
             tiny: false,
             target: 70.0,
+            metric: OnceCell::new(),
         };
         assert!(verify(&source, &bytes, false).unwrap().unwrap() >= 70.0);
         let _work = avif_work().unwrap();

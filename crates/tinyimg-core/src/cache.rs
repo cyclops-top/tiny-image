@@ -29,7 +29,7 @@ const MAX_MARKER_BYTES: u64 = 4096;
 const ENGINE: &str = concat!(
     "tinyimg/",
     env!("CARGO_PKG_VERSION"),
-    ";processed-output-v1;oxipng=10.2.1;imagequant=4.4.1;",
+    ";processed-output-v2-adaptive-search;oxipng=10.2.1;imagequant=4.4.1;",
     "webp=0.3.1;libwebp-sys=0.9.6;mozjpeg=0.10.13;mozjpeg-sys=2.2.3;",
     "ssimulacra2=0.5.1;image=0.25.10;ravif=0.13.0-no-default-features;",
     "avif-decode=3.0.0-vendored;rav1d=1.1.0-no-asm-bitdepth8-bitdepth16-threads1"
