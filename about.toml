@@ -1,0 +1,14 @@
+# See docs/DEPENDENCIES.md. This is a policy, not a generated inventory.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    "IJG",
+    "GPL-3.0-or-later",
+]
+ignore-build-dependencies = false
+ignore-dev-dependencies = false
+ignore-transitive-dependencies = false

@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      extra_platform:
+        description: Optional native platform checks (Linux always runs)
+        type: choice
+        default: none
+        options:
+          - none
+          - macos
+          - windows
+          - both
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.extra_platform == 'both' && '["ubuntu-latest","macos-latest","windows-latest"]' || github.event_name == 'workflow_dispatch' && inputs.extra_platform == 'macos' && '["ubuntu-latest","macos-latest"]' || github.event_name == 'workflow_dispatch' && inputs.extra_platform == 'windows' && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Formatting
+        run: cargo +stable fmt --all --check
+      - name: Lints
+        run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo +stable test --locked --workspace
+      - name: Release build
+        run: cargo +stable build --locked --release -p tinyimg-cli
+      - name: CLI smoke test
+        run: cargo +stable run --locked -p tinyimg-cli -- --help
+
+  licenses:
+    name: Dependency license policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install cargo-deny
+        run: cargo +stable install --locked cargo-deny
+      - name: Check licenses and sources
+        run: cargo +stable deny check licenses sources

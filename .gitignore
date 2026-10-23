@@ -1,0 +1,9 @@
+/target/
+/dist/
+/.tinyimg-cache/
+/THIRD-PARTY-LICENSES.json
+/tinyimg-report.json
+.DS_Store
+Thumbs.db
+*.tmp
+# Cargo.lock is intentionally committed for reproducible CLI builds.

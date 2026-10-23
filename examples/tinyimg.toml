@@ -1,0 +1,33 @@
+# Copy to the project or input directory, or pass --config PATH.
+# Automatic discovery starts at the first input and walks upward.
+# Priority: defaults < top-level config < matching overrides (in order) < CLI.
+# Presets are experimental: high=88, balanced=80, small=70.
+preset = "balanced"
+formats = ["png", "webp"]
+keep_format = false
+min_saving = 10
+min_bytes = 2048
+strip_all = false
+keep_metadata = false
+# score = 88  # In the same layer, an explicit score wins over preset.
+# include = ["**/*.png", "**/*.webp", "**/*.jpg"]
+exclude = ["**/vendor/**", "**/generated/**"]
+
+# Glob paths always use / separators, including on Windows.
+# Paths are relative to the scanned input root, not the config file.
+# For: tinyimg app/src/main/res
+[[overrides]]
+glob = "drawable*/**"
+score = 88
+
+# Multiple matching entries are applied in their file order.
+[[overrides]]
+glob = "drawable*/text_*.png"
+score = 95
+keep_format = true
+
+# Directory overrides are for per-image quality, formats and size policy.
+# include/exclude are top-level only; putting them in overrides is an error.
+# --score, --preset, --formats, etc. on the CLI override matching entries.
+# assets paths always keep their extension, even when keep_format = false.
+# avif is not implemented; do not add it expecting an AVIF encoder.

@@ -1,0 +1,64 @@
+# Manual build only. This workflow does not publish a GitHub Release or a crate.
+name: Build review artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Native artifact platform to build for review
+        type: choice
+        default: linux
+        options:
+          - linux
+          - macos
+          - windows
+          - all
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.platform == 'all' && '["ubuntu-latest","macos-latest","windows-latest"]' || inputs.platform == 'macos' && '["macos-latest"]' || inputs.platform == 'windows' && '["windows-latest"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Test and build
+        run: |
+          cargo +stable test --locked --workspace
+          cargo +stable build --locked --release -p tinyimg-cli
+      - name: Install inventory generator
+        run: cargo +stable install --locked cargo-about --features cli
+      - name: Generate dependency inventory
+        run: cargo +stable about generate --locked --workspace --fail --format json -o THIRD-PARTY-LICENSES.json
+      - name: Remove machine-local inventory paths
+        run: python scripts/sanitize_license_inventory.py
+      - name: Stage binary and source for review
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          binary=tinyimg
+          if [ "${{ runner.os }}" = "Windows" ]; then binary=tinyimg.exe; fi
+          cp "target/release/$binary" dist/
+          cp LICENSE README.md Cargo.lock THIRD-PARTY-LICENSES.json dist/
+          cp -R docs dist/docs
+          git archive --format=tar --output=dist/tinyimg-source.tar HEAD
+          printf '%s\n' "Review artifacts only; no public release has been made." > dist/REVIEW-ONLY.txt
+          printf '%s\n' "${{ github.sha }}" > dist/SOURCE-COMMIT.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tinyimg-review-${{ runner.os }}-${{ runner.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

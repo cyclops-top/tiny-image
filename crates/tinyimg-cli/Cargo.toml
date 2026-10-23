@@ -1,0 +1,23 @@
+[package]
+name = "tinyimg-cli"
+description = "Offline perceptual image optimization CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tinyimg"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+tinyimg-core = { path = "../tinyimg-core" }
+
+[dev-dependencies]
+tempfile.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
